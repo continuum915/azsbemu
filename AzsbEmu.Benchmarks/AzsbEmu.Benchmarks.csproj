@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.10" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AzsbEmu.Server\AzsbEmu.Server.csproj" />
+    <ProjectReference Include="..\AzsbEmu.Tests\AzsbEmu.Tests.csproj" />
+  </ItemGroup>
+
+</Project>

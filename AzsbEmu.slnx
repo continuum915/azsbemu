@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="AzsbEmu.Server/AzsbEmu.Server.csproj" />
+  <Project Path="AzsbEmu.Tests/AzsbEmu.Tests.csproj" />
+  <Project Path="AzsbEmu.Benchmarks/AzsbEmu.Benchmarks.csproj" />
+</Solution>
