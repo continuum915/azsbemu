@@ -27,6 +27,19 @@ public class AutoDeleteOnIdleTests : IDisposable
     private void CreateQueue(string name, TimeSpan autoDeleteOnIdle) =>
         Assert.True(Entities.CreateQueue(new QueueInfo { Name = name, AutoDeleteOnIdle = autoDeleteOnIdle }));
 
+    /// <summary>
+    /// Gives an existing queue the short idle time. Tests that use a queue through a client do this after the client's
+    /// first operation, which opens the connection and link and can take seconds on a busy machine: counted against the
+    /// idle time, that setup alone could get the queue deleted.
+    /// </summary>
+    private void ShortenAutoDeleteOnIdle(string queueName)
+    {
+        var queue = _broker.GetQueue(queueName);
+        var desired = queue.WithConfigurationFrom(queue);
+        desired.AutoDeleteOnIdle = ShortIdle;
+        Assert.Null(Entities.UpdateQueue(desired).Error);
+    }
+
     /// <summary>Waits up to <paramref name="within"/> for <paramref name="condition"/>.</summary>
     private static async Task<bool> EventuallyAsync(Func<bool> condition, TimeSpan within)
     {
@@ -42,7 +55,7 @@ public class AutoDeleteOnIdleTests : IDisposable
     [Fact]
     public async Task AnIdleQueue_IsDeleted_WithItsMessagesAndDeadLetters()
     {
-        CreateQueue("idle-queue", ShortIdle);
+        _broker.EnsureQueue("idle-queue");
         await using (var client = _broker.CreateServiceBusClient())
         {
             await using var sender = client.CreateSender("idle-queue");
@@ -51,6 +64,7 @@ public class AutoDeleteOnIdleTests : IDisposable
             var toDeadLetter = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
             await receiver.DeadLetterMessageAsync(toDeadLetter);
         }
+        ShortenAutoDeleteOnIdle("idle-queue");
         Assert.Equal(1, _broker.GetQueue("idle-queue").DeadLetterMessageCount);
 
         Assert.True(await EventuallyAsync(() => Entities.GetQueue("idle-queue") is null, TimeSpan.FromSeconds(10)), "the idle queue was not deleted");
@@ -76,9 +90,11 @@ public class AutoDeleteOnIdleTests : IDisposable
     [Fact]
     public async Task Sends_KeepAQueueAlive_UntilTheyStop()
     {
-        CreateQueue("busy-queue", ShortIdle);
+        _broker.EnsureQueue("busy-queue");
         await using var client = _broker.CreateServiceBusClient();
         await using var sender = client.CreateSender("busy-queue");
+        await sender.SendMessageAsync(new ServiceBusMessage("connect"));
+        ShortenAutoDeleteOnIdle("busy-queue");
 
         var until = DateTime.UtcNow + ShortIdle * 2.5;
         while (DateTime.UtcNow < until)
@@ -94,10 +110,11 @@ public class AutoDeleteOnIdleTests : IDisposable
     [Fact]
     public async Task AnOpenReceiver_KeepsAQueueAlive_AndClosingItStartsTheIdleClock()
     {
-        CreateQueue("watched-queue", ShortIdle);
+        _broker.EnsureQueue("watched-queue");
         await using var client = _broker.CreateServiceBusClient();
         var receiver = client.CreateReceiver("watched-queue");
         Assert.Null(await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500))); // attaches the link
+        ShortenAutoDeleteOnIdle("watched-queue");
 
         await Task.Delay(ShortIdle * 2.5);
         Assert.NotNull(Entities.GetQueue("watched-queue"));
@@ -111,11 +128,13 @@ public class AutoDeleteOnIdleTests : IDisposable
     [Fact]
     public async Task ManagementOperations_KeepAQueueAlive()
     {
-        CreateQueue("peeked-queue", ShortIdle);
+        _broker.EnsureQueue("peeked-queue");
         await using var client = _broker.CreateServiceBusClient();
 
         // Peeking goes over the management link and opens no receive link, so only the operations themselves count.
         await using var peeker = client.CreateReceiver("peeked-queue");
+        await peeker.PeekMessageAsync();
+        ShortenAutoDeleteOnIdle("peeked-queue");
         var until = DateTime.UtcNow + ShortIdle * 2.5;
         while (DateTime.UtcNow < until)
         {
@@ -153,12 +172,14 @@ public class AutoDeleteOnIdleTests : IDisposable
     [Fact]
     public async Task MessagesForwardedIntoAQueue_KeepItAlive()
     {
-        CreateQueue("forward-target", ShortIdle);
+        _broker.EnsureQueue("forward-target");
         _broker.EnsureTopic("forwarding-topic");
         Assert.True(Entities.CreateSubscription("forwarding-topic", new SubscriptionInfo { Name = "to-queue", ForwardTo = "forward-target" }));
 
         await using var client = _broker.CreateServiceBusClient();
         await using var sender = client.CreateSender("forwarding-topic");
+        await sender.SendMessageAsync(new ServiceBusMessage("connect"));
+        ShortenAutoDeleteOnIdle("forward-target");
         var until = DateTime.UtcNow + ShortIdle * 2.5;
         while (DateTime.UtcNow < until)
         {
