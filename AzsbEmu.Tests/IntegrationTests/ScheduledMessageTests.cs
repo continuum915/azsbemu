@@ -92,18 +92,19 @@ public class ScheduledMessageTests : IDisposable
         // Verify topic reports scheduled message count in database
         Assert.Equal(1, _broker.GetScheduledMessageCount(TopicName));
 
-        // Wait for it to become due
-        await Task.Delay(TimeSpan.FromSeconds(3));
-
-        // Receive from subscription
+        // Receive from subscription once it is due (the receive waits for it)
         await using var receiver = _client.CreateReceiver(TopicName, SubscriptionName);
-        var received = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+        var received = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(30));
         Assert.NotNull(received);
+        Assert.True(DateTimeOffset.UtcNow >= scheduledTime - TimeSpan.FromMilliseconds(200), "delivered before it was due");
         Assert.Equal("receive-me-topic-payload", received.Body.ToString());
 
         await receiver.CompleteMessageAsync(received);
 
-        // Verify count is 0
+        // The scheduler enqueues a due message before deleting its schedule row (so a crash cannot lose it), so the
+        // count can briefly still be 1 after the message is receivable.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (_broker.GetScheduledMessageCount(TopicName) != 0 && DateTime.UtcNow < deadline) await Task.Delay(50);
         Assert.Equal(0, _broker.GetScheduledMessageCount(TopicName));
     }
 

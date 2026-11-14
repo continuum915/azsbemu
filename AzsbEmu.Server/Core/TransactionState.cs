@@ -38,14 +38,13 @@ public class BufferedSettlement
 {
     public Guid LockToken { get; }
     public object Outcome { get; } // Amqp.Framing.Outcome or string dispositionStatus for management
-    public string? DeadLetterReason { get; }
-    public string? DeadLetterDescription { get; }
+    /// <summary>Dead-letter details supplied through management (a link disposition carries them in its outcome).</summary>
+    public DeadLetterDetails? DeadLetter { get; }
 
-    public BufferedSettlement(Guid lockToken, object outcome, string? dlReason = null, string? dlDescription = null)
+    public BufferedSettlement(Guid lockToken, object outcome, DeadLetterDetails? deadLetter = null)
     {
         LockToken = lockToken;
         Outcome = outcome;
-        DeadLetterReason = dlReason;
-        DeadLetterDescription = dlDescription;
+        DeadLetter = deadLetter;
     }
 }

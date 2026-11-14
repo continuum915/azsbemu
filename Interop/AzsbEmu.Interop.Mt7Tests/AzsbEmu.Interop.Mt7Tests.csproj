@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- MassTransit 7.3 against the emulator, talking to a MassTransit 8 bus run as a separate process
+       (AzsbEmu.Interop.Mt8Peer): the two MassTransit versions cannot load into one process. -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- MassTransit 7.3 only requires Azure.Messaging.ServiceBus 7.5; UseDevelopmentEmulator needs a recent SDK. -->
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.21.0" />
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="MassTransit.Azure.ServiceBus.Core" Version="7.3.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.7" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.7" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\AzsbEmu.Server\AzsbEmu.Server.csproj" />
+    <ProjectReference Include="..\AzsbEmu.Interop.Contracts\AzsbEmu.Interop.Contracts.csproj" />
+    <!-- Built first so the tests can start it; not referenced, since it carries MassTransit 8. -->
+    <ProjectReference Include="..\AzsbEmu.Interop.Mt8Peer\AzsbEmu.Interop.Mt8Peer.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\AzsbEmu.Tests\IntegrationTests\BrokerFixture.cs" Link="BrokerFixture.cs" />
+  </ItemGroup>
+
+</Project>

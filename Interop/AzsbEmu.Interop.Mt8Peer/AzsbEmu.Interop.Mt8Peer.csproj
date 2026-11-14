@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.21.0" />
+    <PackageReference Include="MassTransit.Azure.ServiceBus.Core" Version="8.5.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AzsbEmu.Interop.Contracts\AzsbEmu.Interop.Contracts.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,16 @@
+# Only the server's sources are needed to build the image.
+**/bin
+**/obj
+.git
+.vs
+.claude
+.agents
+.github
+.scratch
+docs
+vendor
+publish
+Interop
+AzsbEmu.Tests
+AzsbEmu.Benchmarks
+*.md

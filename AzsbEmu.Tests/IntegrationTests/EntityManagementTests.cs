@@ -95,8 +95,7 @@ public class EntityManagementTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => _broker.GetQueue(queueName));
 
         // Verify physical directories are purged
-        string safeName = queueName.Replace("/", "_");
-        string entityDir = Path.Combine(_broker.DataDir, "entities", safeName);
+        string entityDir = Path.Combine(_broker.DataDir, "entities", EntityManager.EncodePathSegment(queueName));
         Assert.False(Directory.Exists(entityDir));
 
         await session.CloseAsync();
@@ -191,12 +190,59 @@ public class EntityManagementTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => _broker.GetSubscription(topicName, subName));
 
         // Verify physical directories are purged
-        string safeTopicName = topicName.Replace("/", "_");
-        string entityDir = Path.Combine(_broker.DataDir, "entities", safeTopicName);
+        string entityDir = Path.Combine(_broker.DataDir, "entities", EntityManager.EncodePathSegment(topicName));
         Assert.False(Directory.Exists(entityDir));
 
         await session.CloseAsync();
         await connection.CloseAsync();
+    }
+
+    [Fact]
+    public async Task EntityManagement_DeadLetteringOnMessageExpiration_IsHonoured_ForQueuesAndSubscriptions()
+    {
+        // Ticket 17: the $management create operations used to ignore this flag (the HTTP API honoured it).
+        var factory = new ConnectionFactory();
+        factory.SASL.Profile = new ClientMssbcbsSaslProfile();
+        var connection = await factory.CreateAsync(new Address($"amqp://localhost:{_broker.Port}"));
+        var session = new Session(connection);
+        _broker.EnsureTopic("expiry-topic");
+
+        async Task<Map> CreateAsync(string operation, Map body)
+        {
+            var request = new Message(body) { ApplicationProperties = new ApplicationProperties() };
+            request.ApplicationProperties["operation"] = operation;
+            var response = await SendManagementRequestAsync(session, request);
+            Assert.Equal(201, response.ApplicationProperties?["status-code"]);
+            return Assert.IsType<Map>(response.Body);
+        }
+
+        var queueResponse = await CreateAsync("com.microsoft:create-queue",
+            new Map { ["entity-name"] = "expiry-dlq-queue", ["dead-lettering-on-message-expiration"] = true });
+        var subResponse = await CreateAsync("com.microsoft:create-subscription",
+            new Map { ["topic-name"] = "expiry-topic", ["subscription-name"] = "expiry-dlq-sub", ["dead-lettering-on-message-expiration"] = true });
+        Assert.Equal(true, queueResponse["dead-lettering-on-message-expiration"]);
+        Assert.Equal(true, subResponse["dead-lettering-on-message-expiration"]);
+        Assert.True(_broker.GetQueue("expiry-dlq-queue").DeadLetteringOnMessageExpiration);
+        Assert.True(_broker.GetSubscription("expiry-topic", "expiry-dlq-sub").DeadLetteringOnMessageExpiration);
+
+        await session.CloseAsync();
+        await connection.CloseAsync();
+
+        // Expired messages are dead-lettered rather than discarded.
+        await using var client = _broker.CreateServiceBusClient();
+        await using (var queueSender = client.CreateSender("expiry-dlq-queue"))
+            await queueSender.SendMessageAsync(new ServiceBusMessage("expires") { TimeToLive = TimeSpan.FromSeconds(1) });
+        await using (var topicSender = client.CreateSender("expiry-topic"))
+            await topicSender.SendMessageAsync(new ServiceBusMessage("expires") { TimeToLive = TimeSpan.FromSeconds(1) });
+
+        var deadline = DateTime.UtcNow.AddSeconds(15); // the TTL scan runs every 5 seconds
+        while (DateTime.UtcNow < deadline
+               && (_broker.GetQueue("expiry-dlq-queue").DeadLetterMessageCount == 0
+                   || _broker.GetSubscription("expiry-topic", "expiry-dlq-sub").DeadLetterMessageCount == 0))
+            await Task.Delay(200);
+
+        Assert.Equal(1, _broker.GetQueue("expiry-dlq-queue").DeadLetterMessageCount);
+        Assert.Equal(1, _broker.GetSubscription("expiry-topic", "expiry-dlq-sub").DeadLetterMessageCount);
     }
 
     private async Task<Message> SendManagementRequestAsync(Session session, Message request)

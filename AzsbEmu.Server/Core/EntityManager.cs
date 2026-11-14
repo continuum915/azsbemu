@@ -8,7 +8,7 @@ using Microsoft.Extensions.Logging;
 
 namespace AzsbEmu.Server.Core;
 
-public class EntityManager : IDisposable
+public partial class EntityManager : IDisposable
 {
     private readonly string _connectionString;
     private readonly string _dataDir;
@@ -25,6 +25,8 @@ public class EntityManager : IDisposable
     private readonly ConcurrentDictionary<string, TransactionState> _transactions = new(StringComparer.OrdinalIgnoreCase);
     private readonly CancellationTokenSource _transactionCts = new();
     private readonly Task _transactionTask;
+    private readonly CancellationTokenSource _autoDeleteCts = new();
+    private readonly Task _autoDeleteTask;
 
     public event Action<string>? ManagementAddressAdded;
 
@@ -43,6 +45,7 @@ public class EntityManager : IDisposable
         _ttlTask = RunTtlScanLoopAsync(_ttlCts.Token);
         _schedulerTask = RunSchedulerScanLoopAsync(_schedulerCts.Token);
         _transactionTask = RunTransactionTimeoutScanLoopAsync(_transactionCts.Token);
+        _autoDeleteTask = RunAutoDeleteLoopAsync(_autoDeleteCts.Token);
     }
 
     private void InitializeDatabase()
@@ -132,6 +135,10 @@ public class EntityManager : IDisposable
             alterCmd.CommandText = "ALTER TABLE Subscriptions ADD COLUMN DefaultTtlSeconds INTEGER DEFAULT -1";
             alterCmd.ExecuteNonQuery();
         }
+
+        AddQueueColumns(connection);
+        AddColumns(connection, "Topics", AddedTopicColumns);
+        AddColumns(connection, "Subscriptions", AddedSubscriptionColumns);
     }
 
     private static bool ColumnExists(SqliteConnection connection, string tableName, string columnName)
@@ -153,56 +160,39 @@ public class EntityManager : IDisposable
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
 
+        MigrateLegacyStorageLayout(connection);
+
         var qCmd = connection.CreateCommand();
-        qCmd.CommandText = "SELECT Name, RequiresSession, LockDurationSeconds, MaxSizeInMegabytes, MaxDeliveryCount, DefaultTtlSeconds FROM Queues";
+        qCmd.CommandText = SelectQueueRows;
         using (var reader = qCmd.ExecuteReader())
         {
             while (reader.Read())
             {
-                long ttlSeconds = reader.IsDBNull(5) ? -1 : reader.GetInt64(5);
-                var q = new QueueInfo
-                {
-                    Name = reader.GetString(0),
-                    RequiresSession = reader.GetInt32(1) != 0,
-                    LockDuration = TimeSpan.FromSeconds(reader.GetInt32(2)),
-                    MaxSizeInMegabytes = reader.GetInt64(3),
-                    MaxDeliveryCount = reader.IsDBNull(4) ? 10 : reader.GetInt32(4),
-                    DefaultMessageTimeToLive = ttlSeconds > 0 ? TimeSpan.FromSeconds(ttlSeconds) : TimeSpan.MaxValue
-                };
+                var q = ReadQueueRow(reader);
                 InitializeEntityStorage(q);
                 _queues[q.Name] = q;
             }
         }
 
         var tCmd = connection.CreateCommand();
-        tCmd.CommandText = "SELECT Name FROM Topics";
+        tCmd.CommandText = "SELECT * FROM Topics";
         using (var reader = tCmd.ExecuteReader())
         {
             while (reader.Read())
             {
-                var t = new TopicInfo { Name = reader.GetString(0) };
+                var t = ReadTopicRow(reader);
                 _topics[t.Name] = t;
             }
         }
 
         var sCmd = connection.CreateCommand();
-        sCmd.CommandText = "SELECT TopicName, Name, RequiresSession, LockDurationSeconds, MaxDeliveryCount, DefaultTtlSeconds FROM Subscriptions";
+        sCmd.CommandText = "SELECT * FROM Subscriptions";
         using (var reader = sCmd.ExecuteReader())
         {
             while (reader.Read())
             {
-                var topicName = reader.GetString(0);
-                long ttlSeconds = reader.IsDBNull(5) ? -1 : reader.GetInt64(5);
-                var sub = new SubscriptionInfo
-                {
-                    TopicName = topicName,
-                    Name = reader.GetString(1),
-                    RequiresSession = reader.GetInt32(2) != 0,
-                    LockDuration = TimeSpan.FromSeconds(reader.IsDBNull(3) ? 60 : reader.GetInt32(3)),
-                    MaxDeliveryCount = reader.IsDBNull(4) ? 10 : reader.GetInt32(4),
-                    DefaultMessageTimeToLive = ttlSeconds > 0 ? TimeSpan.FromSeconds(ttlSeconds) : TimeSpan.MaxValue
-                };
-                if (_topics.TryGetValue(topicName, out var topic))
+                var sub = ReadSubscriptionRow(reader);
+                if (_topics.TryGetValue(sub.TopicName, out var topic))
                 {
                     InitializeEntityStorage(sub);
                     topic.Subscriptions.Add(sub);
@@ -243,7 +233,7 @@ public class EntityManager : IDisposable
             {
                 if (sub.Rules.Count == 0)
                 {
-                    sub.Rules.Add(new RuleInfo { Name = "$Default", FilterType = "True" });
+                    sub.Rules.Add(RuleInfo.CreateDefault());
                 }
             }
         }
@@ -253,15 +243,14 @@ public class EntityManager : IDisposable
 
     private void InitializeEntityStorage(QueueInfo queue)
     {
-        string safeName = queue.Name.Replace("/", "_");
-        string entityDir = Path.Combine(_dataDir, "entities", safeName);
+        string entityDir = QueueDirectory(queue.Name);
         Directory.CreateDirectory(entityDir);
 
         string path = Path.Combine(entityDir, "messages.log");
         queue.MessageStore = new MessageStore(path, _loggerFactory.CreateLogger($"Store:{queue.Name}"));
 
         string dlqPath = Path.Combine(entityDir, "dlq.log");
-        queue.DlqMessageStore = new MessageStore(dlqPath, _loggerFactory.CreateLogger($"Store:{queue.Name}/$dlq"));
+        queue.DlqMessageStore = new MessageStore(dlqPath, _loggerFactory.CreateLogger($"Store:{queue.Name}/$dlq"), DeadLetterCommitDirectory(entityDir));
 
         var (seqMax, count) = ScanLogForStartupState(queue.MessageStore, queue.Name, queue.RequiresSession ? queue.SessionMessageAddresses : null);
         var (dlqSeqMax, dlqCount) = ScanLogForStartupState(queue.DlqMessageStore, $"{queue.Name}/$dlq", null);
@@ -269,23 +258,22 @@ public class EntityManager : IDisposable
         queue.MessageCount = count;
         queue.DeadLetterMessageCount = dlqCount;
 
-        queue.Dispatcher = new Dispatcher(queue.MessageStore, _loggerFactory.CreateLogger($"Dispatcher:{queue.Name}"));
+        queue.Dispatcher = new Dispatcher(queue.MessageStore, _loggerFactory.CreateLogger($"Dispatcher:{queue.Name}"),
+            queue.RequiresSession ? queue.SessionMessageAddresses : null);
         queue.Dispatcher.StartLockMonitor(queue.LockDuration, (addr, token) => HandleLockExpiryAsync(queue, addr, token));
         queue.DlqDispatcher = new Dispatcher(queue.DlqMessageStore, _loggerFactory.CreateLogger($"Dispatcher:{queue.Name}/$dlq"));
     }
 
     private void InitializeEntityStorage(SubscriptionInfo sub)
     {
-        string safeTopic = sub.TopicName.Replace("/", "_");
-        string safeSub = sub.Name.Replace("/", "_");
-        string subDir = Path.Combine(_dataDir, "entities", safeTopic, "subscriptions", safeSub);
+        string subDir = SubscriptionDirectory(sub.TopicName, sub.Name);
         Directory.CreateDirectory(subDir);
 
         string path = Path.Combine(subDir, "messages.log");
         sub.MessageStore = new MessageStore(path, _loggerFactory.CreateLogger($"Store:{sub.TopicName}/Sub:{sub.Name}"));
 
         string dlqPath = Path.Combine(subDir, "dlq.log");
-        sub.DlqMessageStore = new MessageStore(dlqPath, _loggerFactory.CreateLogger($"Store:{sub.TopicName}/Sub:{sub.Name}/$dlq"));
+        sub.DlqMessageStore = new MessageStore(dlqPath, _loggerFactory.CreateLogger($"Store:{sub.TopicName}/Sub:{sub.Name}/$dlq"), DeadLetterCommitDirectory(subDir));
 
         var (seqMax, count) = ScanLogForStartupState(sub.MessageStore, $"{sub.TopicName}/Sub:{sub.Name}", sub.RequiresSession ? sub.SessionMessageAddresses : null);
         var (dlqSeqMax, dlqCount) = ScanLogForStartupState(sub.DlqMessageStore, $"{sub.TopicName}/Sub:{sub.Name}/$dlq", null);
@@ -293,7 +281,8 @@ public class EntityManager : IDisposable
         sub.MessageCount = count;
         sub.DeadLetterMessageCount = dlqCount;
 
-        sub.Dispatcher = new Dispatcher(sub.MessageStore, _loggerFactory.CreateLogger($"Dispatcher:{sub.TopicName}/Sub:{sub.Name}"));
+        sub.Dispatcher = new Dispatcher(sub.MessageStore, _loggerFactory.CreateLogger($"Dispatcher:{sub.TopicName}/Sub:{sub.Name}"),
+            sub.RequiresSession ? sub.SessionMessageAddresses : null);
         sub.Dispatcher.StartLockMonitor(sub.LockDuration, (addr, token) => HandleLockExpiryAsync(sub, addr, token));
         sub.DlqDispatcher = new Dispatcher(sub.DlqMessageStore, _loggerFactory.CreateLogger($"Dispatcher:{sub.TopicName}/Sub:{sub.Name}/$dlq"));
     }
@@ -301,7 +290,7 @@ public class EntityManager : IDisposable
     private (long seqMax, long count) ScanLogForStartupState(
         MessageStore store, 
         string entityName, 
-        ConcurrentDictionary<string, ConcurrentQueue<long>>? sessionQueue = null)
+        ConcurrentDictionary<string, SessionMessageQueue>? sessionQueue = null)
     {
         var log = store.Log;
         long snapshotTail = log.TailAddress;
@@ -332,7 +321,7 @@ public class EntityManager : IDisposable
                             string? sessionId = message.Properties?.GroupId;
                             if (!string.IsNullOrEmpty(sessionId))
                             {
-                                var q = sessionQueue.GetOrAdd(sessionId, _ => new ConcurrentQueue<long>());
+                                var q = sessionQueue.GetOrAdd(sessionId, _ => new SessionMessageQueue());
                                 q.Enqueue(address);
                             }
                         }
@@ -411,35 +400,55 @@ public class EntityManager : IDisposable
         }
     }
 
-    public async Task DeadLetterMessageAsync(IMessageEntity entity, long address, string? reason, string? description)
+    /// <summary>
+    /// Retires a message found expired when it was about to be delivered: dead-lettered (TTLExpiredException) if the
+    /// entity has DeadLetteringOnMessageExpiration, otherwise discarded.
+    /// </summary>
+    public async Task ExpireMessageAsync(IMessageEntity entity, long address, long sequenceNumber)
+    {
+        LogExpiry(entity, sequenceNumber);
+        if (entity.DeadLetteringOnMessageExpiration)
+        {
+            await DeadLetterMessageAsync(entity, address, DeadLetterDetails.TtlExpired.Reason, DeadLetterDetails.TtlExpired.Description)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (entity.Dispatcher is { } dispatcher)
+        {
+            dispatcher.ForceComplete(address);
+            entity.DecrementMessageCount();
+        }
+    }
+
+    public Task DeadLetterMessageAsync(IMessageEntity entity, long address, string? reason, string? description) =>
+        DeadLetterMessageAsync(entity, address, DeadLetterDetails.WithReason(reason, description));
+
+    public async Task DeadLetterMessageAsync(IMessageEntity entity, long address, DeadLetterDetails details)
     {
         var dispatcher = entity.Dispatcher;
         var store = entity.MessageStore;
-        var dlqStore = entity.DlqMessageStore;
-        
-        if (dispatcher == null || store == null || dlqStore == null) return;
+
+        if (dispatcher == null || store == null || entity.DlqMessageStore == null) return;
 
         try
         {
             var dataResult = await store.ReadAsync(address);
             var (oldHeader, message) = MessageSerializer.Decode(dataResult.data);
-            
+
             var header = oldHeader with
             {
-                IsDeadLettered = true,
                 DeliveryCount = oldHeader.DeliveryCount + dispatcher.GetDeliveryCount(address)
             };
 
+            dispatcher.ApplyModifiedProperties(address, message); // from earlier abandons and defers
+            PropertiesToModify.ApplyTo(details.PropertiesToModify, message);
             message.ApplicationProperties ??= new ApplicationProperties();
-            if (reason != null) message.ApplicationProperties["DeadLetterReason"] = reason;
-            if (description != null) message.ApplicationProperties["DeadLetterErrorDescription"] = description;
+            if (details.Reason != null) message.ApplicationProperties[DeadLetterDetails.ReasonProperty] = details.Reason;
+            if (details.Description != null) message.ApplicationProperties[DeadLetterDetails.DescriptionProperty] = details.Description;
 
-            byte[] encoded = MessageSerializer.Encode(message, header);
-            await dlqStore.AppendAsync(encoded);
-             
+            await MoveToDeadLetterLogAsync(entity, header, message);
             dispatcher.ForceComplete(address);
-            entity.DecrementMessageCount();
-            entity.IncrementDeadLetterMessageCount();
         }
         catch (Exception ex)
         {
@@ -447,30 +456,75 @@ public class EntityManager : IDisposable
         }
     }
 
+    private readonly object _createLock = new();
+    private const int SqliteConstraintViolation = 19; // SQLITE_CONSTRAINT
+
+    /// <summary>A snapshot of a topic's subscriptions, or null if the topic does not exist.</summary>
+    public IReadOnlyList<SubscriptionInfo>? GetSubscriptions(string topicName)
+    {
+        var topic = GetTopic(topicName);
+        if (topic == null) return null;
+        lock (topic.Subscriptions) return topic.Subscriptions.ToList();
+    }
+
+    /// <summary>The number of messages scheduled for <paramref name="entity"/> (a queue or subscription) or a topic.</summary>
+    public int GetScheduledMessageCount(IMessageEntity entity) =>
+        GetScheduledMessageCount(entity is SubscriptionInfo sub ? $"{sub.TopicName}/subscriptions/{sub.Name}" : entity.Name);
+
+    /// <summary>Finds a subscription by topic and subscription name, both case-insensitively.</summary>
+    public SubscriptionInfo? GetSubscription(string topicName, string subscriptionName)
+    {
+        var topic = GetTopic(topicName);
+        if (topic == null) return null;
+        lock (topic.Subscriptions)
+        {
+            return topic.Subscriptions.Find(s => string.Equals(s.Name, subscriptionName, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    /// <summary>
+    /// Creates a queue. Returns false if a queue or topic of that name (in any casing) already exists; the check and
+    /// the insert happen under one lock so concurrent creates of the same name produce exactly one queue.
+    /// </summary>
     public bool CreateQueue(QueueInfo queue)
     {
-        if (_queues.ContainsKey(queue.Name)) return false;
+        lock (_createLock)
+        {
+            if (_queues.ContainsKey(queue.Name) || _topics.ContainsKey(queue.Name)) return false;
 
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = "INSERT INTO Queues (Name, RequiresSession, LockDurationSeconds, MaxSizeInMegabytes, MaxDeliveryCount, DefaultTtlSeconds) VALUES ($name, $session, $lock, $size, $maxdc, $ttl)";
-        cmd.Parameters.AddWithValue("$name", queue.Name);
-        cmd.Parameters.AddWithValue("$session", queue.RequiresSession ? 1 : 0);
-        cmd.Parameters.AddWithValue("$lock", (int)queue.LockDuration.TotalSeconds);
-        cmd.Parameters.AddWithValue("$size", queue.MaxSizeInMegabytes);
-        cmd.Parameters.AddWithValue("$maxdc", queue.MaxDeliveryCount);
-        cmd.Parameters.AddWithValue("$ttl", queue.DefaultMessageTimeToLive == TimeSpan.MaxValue ? -1 : (long)queue.DefaultMessageTimeToLive.TotalSeconds);
-        
-        try {
-            cmd.ExecuteNonQuery();
-            InitializeEntityStorage(queue);
+            using var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            if (queue.CreatedAt == default) queue.CreatedAt = DateTime.UtcNow;
+            if (queue.UpdatedAt == default) queue.UpdatedAt = queue.CreatedAt;
+
+            try
+            {
+                WriteRow(connection, null, "Queues", insert: true, QueueKey(queue), QueueColumns(queue));
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteConstraintViolation) // row already exists
+            {
+                return false;
+            }
+
+            try
+            {
+                InitializeEntityStorage(queue);
+            }
+            catch
+            {
+                DisposeEntityStorage(queue);
+                var rollback = connection.CreateCommand();
+                rollback.CommandText = "DELETE FROM Queues WHERE Name = $name";
+                rollback.Parameters.AddWithValue("$name", queue.Name);
+                rollback.ExecuteNonQuery();
+                throw;
+            }
+
             _queues[queue.Name] = queue;
-            ManagementAddressAdded?.Invoke($"{queue.Name}/$management");
-            return true;
-        } catch {
-            return false;
         }
+
+        ManagementAddressAdded?.Invoke($"{queue.Name}/$management");
+        return true;
     }
 
     public QueueInfo? GetQueue(string name) => _queues.TryGetValue(name, out var q) ? q : null;
@@ -479,76 +533,216 @@ public class EntityManager : IDisposable
 
     public IEnumerable<TopicInfo> GetTopics() => _topics.Values;
 
-    public bool CreateTopic(string name)
-    {
-        if (_topics.ContainsKey(name)) return false;
+    public bool CreateTopic(string name) => CreateTopic(new TopicInfo { Name = name });
 
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = "INSERT INTO Topics (Name) VALUES ($name)";
-        cmd.Parameters.AddWithValue("$name", name);
-        
-        try {
-            cmd.ExecuteNonQuery();
-            _topics[name] = new TopicInfo { Name = name };
-            ManagementAddressAdded?.Invoke($"{name}/$management");
-            return true;
-        } catch {
-            return false;
+    /// <summary>
+    /// Creates a topic. Returns false if a queue or topic of that name (in any casing) already exists; shares the
+    /// queue-creation lock so the two kinds cannot race into the same name.
+    /// </summary>
+    public bool CreateTopic(TopicInfo topic)
+    {
+        lock (_createLock)
+        {
+            if (_queues.ContainsKey(topic.Name) || _topics.ContainsKey(topic.Name)) return false;
+
+            using var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            if (topic.CreatedAt == default) topic.CreatedAt = DateTime.UtcNow;
+            if (topic.UpdatedAt == default) topic.UpdatedAt = topic.CreatedAt;
+            try
+            {
+                WriteRow(connection, null, "Topics", insert: true, TopicKey(topic), TopicColumns(topic));
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteConstraintViolation) // row already exists
+            {
+                return false;
+            }
+
+            _topics[topic.Name] = topic;
         }
+
+        ManagementAddressAdded?.Invoke($"{topic.Name}/$management");
+        return true;
     }
 
     public TopicInfo? GetTopic(string name) => _topics.TryGetValue(name, out var t) ? t : null;
 
-    public bool CreateSubscription(string topicName, SubscriptionInfo sub)
+    /// <summary>
+    /// Creates a subscription with <paramref name="defaultRule"/>, or the <c>$Default</c> true-filter rule if none is
+    /// given. Returns false if the topic does not exist or already has a subscription of that name (in any casing);
+    /// check and insert happen under the creation lock.
+    /// </summary>
+    public bool CreateSubscription(string topicName, SubscriptionInfo sub, RuleInfo? defaultRule = null)
     {
-        if (!_topics.TryGetValue(topicName, out var topic)) return false;
-        
-        lock (topic.Subscriptions)
+        var rule = defaultRule ?? RuleInfo.CreateDefault();
+        rule.NormalizeFilter();
+        TopicInfo? topic;
+        lock (_createLock)
         {
-            if (topic.Subscriptions.Exists(s => s.Name == sub.Name)) return false;
-        }
+            if (!_topics.TryGetValue(topicName, out topic)) return false;
+            lock (topic.Subscriptions)
+            {
+                if (topic.Subscriptions.Exists(s => string.Equals(s.Name, sub.Name, StringComparison.OrdinalIgnoreCase))) return false;
+            }
 
-        using var connection = new SqliteConnection(_connectionString);
-        connection.Open();
-        var cmd = connection.CreateCommand();
-        cmd.CommandText = "INSERT INTO Subscriptions (TopicName, Name, RequiresSession, LockDurationSeconds, MaxDeliveryCount, DefaultTtlSeconds) VALUES ($tname, $name, $session, $lock, $maxdc, $ttl)";
-        cmd.Parameters.AddWithValue("$tname", topicName);
-        cmd.Parameters.AddWithValue("$name", sub.Name);
-        cmd.Parameters.AddWithValue("$session", sub.RequiresSession ? 1 : 0);
-        cmd.Parameters.AddWithValue("$lock", (int)sub.LockDuration.TotalSeconds);
-        cmd.Parameters.AddWithValue("$maxdc", sub.MaxDeliveryCount);
-        cmd.Parameters.AddWithValue("$ttl", sub.DefaultMessageTimeToLive == TimeSpan.MaxValue ? -1 : (long)sub.DefaultMessageTimeToLive.TotalSeconds);
-        
-        try {
-            cmd.ExecuteNonQuery();
-            
-            // Auto-insert default rule in SQLite
+            using var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
+            if (sub.CreatedAt == default) sub.CreatedAt = DateTime.UtcNow;
+            if (sub.UpdatedAt == default) sub.UpdatedAt = sub.CreatedAt;
+            try
+            {
+                sub.TopicName = topic.Name;
+                WriteRow(connection, transaction, "Subscriptions", insert: true, SubscriptionKey(sub), SubscriptionColumns(sub));
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteConstraintViolation) // row already exists
+            {
+                return false;
+            }
+
             var ruleCmd = connection.CreateCommand();
-            ruleCmd.CommandText = "INSERT INTO Rules (TopicName, SubscriptionName, RuleName, FilterType) VALUES ($tname, $sname, '$Default', 'True')";
-            ruleCmd.Parameters.AddWithValue("$tname", topicName);
+            ruleCmd.Transaction = transaction;
+            ruleCmd.CommandText = "INSERT INTO Rules (TopicName, SubscriptionName, RuleName, FilterType, FilterExpression, ActionExpression) VALUES ($tname, $sname, $rname, $ftype, $fexpr, $aexpr)";
+            ruleCmd.Parameters.AddWithValue("$tname", topic.Name);
             ruleCmd.Parameters.AddWithValue("$sname", sub.Name);
+            ruleCmd.Parameters.AddWithValue("$rname", rule.Name);
+            ruleCmd.Parameters.AddWithValue("$ftype", rule.FilterType);
+            ruleCmd.Parameters.AddWithValue("$fexpr", rule.FilterExpression ?? "");
+            ruleCmd.Parameters.AddWithValue("$aexpr", rule.ActionExpression ?? "");
             ruleCmd.ExecuteNonQuery();
 
-            InitializeEntityStorage(sub);
-            sub.Rules.Add(new RuleInfo { Name = "$Default", FilterType = "True" });
-            
+            // Storage paths derive from the stored topic name, not the casing the caller used.
+            sub.TopicName = topic.Name;
+            try
+            {
+                InitializeEntityStorage(sub);
+                transaction.Commit();
+            }
+            catch
+            {
+                DisposeEntityStorage(sub);
+                throw;
+            }
+
+            sub.Rules.Add(rule);
             lock (topic.Subscriptions)
             {
                 topic.Subscriptions.Add(sub);
             }
-            
-            ManagementAddressAdded?.Invoke($"{topicName}/subscriptions/{sub.Name}/$management");
-            return true;
-        } catch {
-            return false;
+            topic.Activity.Record();
         }
+
+        ManagementAddressAdded?.Invoke($"{topic.Name}/subscriptions/{sub.Name}/$management");
+        return true;
+    }
+
+    /// <summary>Result of an update: <see cref="Found"/> is false when the entity does not exist; otherwise
+    /// <see cref="Error"/> explains a rejected change, or is null when the update was applied.</summary>
+    public readonly record struct UpdateOutcome(bool Found, string? Error)
+    {
+        public static readonly UpdateOutcome NotFound = new(false, null);
+        public static readonly UpdateOutcome Applied = new(true, null);
+        public static UpdateOutcome Rejected(string error) => new(true, error);
+    }
+
+    /// <summary>
+    /// Applies <paramref name="desired"/>'s settings to the existing queue of that name: validated, persisted, then
+    /// applied to the running queue (lock duration, delivery count, TTL and forwarding take effect immediately).
+    /// </summary>
+    public UpdateOutcome UpdateQueue(QueueInfo desired)
+    {
+        lock (_createLock)
+        {
+            if (GetQueue(desired.Name) is not { } queue) return UpdateOutcome.NotFound;
+            if (desired.RequiresSession != queue.RequiresSession) return UpdateOutcome.Rejected("RequiresSession cannot be changed.");
+            if (desired.RequiresDuplicateDetection != queue.RequiresDuplicateDetection) return UpdateOutcome.Rejected("RequiresDuplicateDetection cannot be changed.");
+            if (desired.EnablePartitioning != queue.EnablePartitioning) return UpdateOutcome.Rejected("EnablePartitioning cannot be changed.");
+            if (ValidateForwardTargets(queue.Name, desired.ForwardTo, desired.ForwardDeadLetteredMessagesTo) is { } forwardError) return UpdateOutcome.Rejected(forwardError);
+
+            var merged = queue.WithConfigurationFrom(desired);
+            merged.UpdatedAt = DateTime.UtcNow;
+            using (var connection = new SqliteConnection(_connectionString))
+            {
+                connection.Open();
+                if (WriteRow(connection, null, "Queues", insert: false, QueueKey(merged), QueueColumns(merged)) == 0) return UpdateOutcome.NotFound;
+            }
+
+            queue.ApplyConfigurationFrom(merged);
+            queue.UpdatedAt = merged.UpdatedAt;
+            queue.Activity.Record();
+            if (queue.Dispatcher != null) queue.Dispatcher.LockDuration = queue.LockDuration;
+            return UpdateOutcome.Applied;
+        }
+    }
+
+    /// <summary>Applies <paramref name="desired"/>'s settings to the existing topic of that name.</summary>
+    public UpdateOutcome UpdateTopic(TopicInfo desired)
+    {
+        lock (_createLock)
+        {
+            if (GetTopic(desired.Name) is not { } topic) return UpdateOutcome.NotFound;
+            if (desired.EnablePartitioning != topic.EnablePartitioning) return UpdateOutcome.Rejected("EnablePartitioning cannot be changed.");
+            if (desired.RequiresDuplicateDetection != topic.RequiresDuplicateDetection) return UpdateOutcome.Rejected("RequiresDuplicateDetection cannot be changed.");
+
+            var merged = topic.WithConfigurationFrom(desired);
+            merged.UpdatedAt = DateTime.UtcNow;
+            using (var connection = new SqliteConnection(_connectionString))
+            {
+                connection.Open();
+                if (WriteRow(connection, null, "Topics", insert: false, TopicKey(merged), TopicColumns(merged)) == 0) return UpdateOutcome.NotFound;
+            }
+
+            topic.ApplyConfigurationFrom(merged);
+            topic.UpdatedAt = merged.UpdatedAt;
+            topic.Activity.Record();
+            return UpdateOutcome.Applied;
+        }
+    }
+
+    /// <summary>Applies <paramref name="desired"/>'s settings to the existing subscription of that topic and name.</summary>
+    public UpdateOutcome UpdateSubscription(string topicName, SubscriptionInfo desired)
+    {
+        lock (_createLock)
+        {
+            if (GetSubscription(topicName, desired.Name) is not { } sub) return UpdateOutcome.NotFound;
+            if (desired.RequiresSession != sub.RequiresSession) return UpdateOutcome.Rejected("RequiresSession cannot be changed.");
+            if (ValidateForwardTargets($"{sub.TopicName}/Subscriptions/{sub.Name}", desired.ForwardTo, desired.ForwardDeadLetteredMessagesTo, owningTopic: sub.TopicName) is { } forwardError)
+                return UpdateOutcome.Rejected(forwardError);
+
+            var merged = sub.WithConfigurationFrom(desired);
+            merged.UpdatedAt = DateTime.UtcNow;
+            using (var connection = new SqliteConnection(_connectionString))
+            {
+                connection.Open();
+                if (WriteRow(connection, null, "Subscriptions", insert: false, SubscriptionKey(merged), SubscriptionColumns(merged)) == 0) return UpdateOutcome.NotFound;
+            }
+
+            sub.ApplyConfigurationFrom(merged);
+            sub.UpdatedAt = merged.UpdatedAt;
+            sub.Activity.Record();
+            GetTopic(sub.TopicName)?.Activity.Record();
+            if (sub.Dispatcher != null) sub.Dispatcher.LockDuration = sub.LockDuration;
+            return UpdateOutcome.Applied;
+        }
+    }
+
+    private void DisposeEntityStorage(IMessageEntity entity)
+    {
+        try { entity.Dispatcher?.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Error disposing dispatcher for {Name}", entity.Name); }
+        try { entity.DlqDispatcher?.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Error disposing DLQ dispatcher for {Name}", entity.Name); }
+        try { entity.MessageStore?.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Error disposing store for {Name}", entity.Name); }
+        try { entity.DlqMessageStore?.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Error disposing DLQ store for {Name}", entity.Name); }
     }
 
     public bool DeleteQueue(string name)
     {
+        lock (_createLock) return DeleteQueueLocked(name);
+    }
+
+    private bool DeleteQueueLocked(string name)
+    {
         if (!_queues.TryRemove(name, out var queue)) return false;
+        name = queue.Name; // the stored casing: SQLite compares names case-sensitively
 
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
@@ -564,7 +758,7 @@ public class EntityManager : IDisposable
 
             var schedCmd = connection.CreateCommand();
             schedCmd.Transaction = transaction;
-            schedCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $name OR EntityName = $dlqName";
+            schedCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $name COLLATE NOCASE OR EntityName = $dlqName COLLATE NOCASE";
             schedCmd.Parameters.AddWithValue("$name", name);
             schedCmd.Parameters.AddWithValue("$dlqName", $"{name}/$deadletterqueue");
             schedCmd.ExecuteNonQuery();
@@ -591,8 +785,7 @@ public class EntityManager : IDisposable
             _logger.LogWarning(ex, "Error disposing runtime structures for queue {Name}", name);
         }
 
-        string safeName = queue.Name.Replace("/", "_");
-        string entityDir = Path.Combine(_dataDir, "entities", safeName);
+        string entityDir = QueueDirectory(queue.Name);
         if (Directory.Exists(entityDir))
         {
             try
@@ -611,7 +804,13 @@ public class EntityManager : IDisposable
 
     public bool DeleteTopic(string name)
     {
+        lock (_createLock) return DeleteTopicLocked(name);
+    }
+
+    private bool DeleteTopicLocked(string name)
+    {
         if (!_topics.TryRemove(name, out var topic)) return false;
+        name = topic.Name; // the stored casing: SQLite compares names case-sensitively
 
         List<SubscriptionInfo> subsToDispose;
         lock (topic.Subscriptions)
@@ -633,7 +832,7 @@ public class EntityManager : IDisposable
 
             var schedCmd = connection.CreateCommand();
             schedCmd.Transaction = transaction;
-            schedCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $name";
+            schedCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $name COLLATE NOCASE";
             schedCmd.Parameters.AddWithValue("$name", name);
             schedCmd.ExecuteNonQuery();
 
@@ -642,7 +841,7 @@ public class EntityManager : IDisposable
                 string subPath = $"{name}/subscriptions/{sub.Name}";
                 var schedSubCmd = connection.CreateCommand();
                 schedSubCmd.Transaction = transaction;
-                schedSubCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $subPath OR EntityName = $dlqPath";
+                schedSubCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $subPath COLLATE NOCASE OR EntityName = $dlqPath COLLATE NOCASE";
                 schedSubCmd.Parameters.AddWithValue("$subPath", subPath);
                 schedSubCmd.Parameters.AddWithValue("$dlqPath", $"{subPath}/$deadletterqueue");
                 schedSubCmd.ExecuteNonQuery();
@@ -673,8 +872,7 @@ public class EntityManager : IDisposable
             }
         }
 
-        string safeName = name.Replace("/", "_");
-        string entityDir = Path.Combine(_dataDir, "entities", safeName);
+        string entityDir = TopicDirectory(name);
         if (Directory.Exists(entityDir))
         {
             try
@@ -693,6 +891,15 @@ public class EntityManager : IDisposable
 
     public bool DeleteSubscription(string topicName, string name)
     {
+        lock (_createLock)
+        {
+            GetTopic(topicName)?.Activity.Record();
+            return DeleteSubscriptionLocked(topicName, name);
+        }
+    }
+
+    private bool DeleteSubscriptionLocked(string topicName, string name)
+    {
         if (!_topics.TryGetValue(topicName, out var topic)) return false;
 
         SubscriptionInfo? subscription = null;
@@ -702,6 +909,8 @@ public class EntityManager : IDisposable
             if (subscription == null) return false;
             topic.Subscriptions.Remove(subscription);
         }
+        topicName = topic.Name; // the stored casing: SQLite compares names case-sensitively
+        name = subscription.Name;
 
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
@@ -719,7 +928,7 @@ public class EntityManager : IDisposable
             string subPath = $"{topicName}/subscriptions/{name}";
             var schedCmd = connection.CreateCommand();
             schedCmd.Transaction = transaction;
-            schedCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $subPath OR EntityName = $dlqPath";
+            schedCmd.CommandText = "DELETE FROM ScheduledMessages WHERE EntityName = $subPath COLLATE NOCASE OR EntityName = $dlqPath COLLATE NOCASE";
             schedCmd.Parameters.AddWithValue("$subPath", subPath);
             schedCmd.Parameters.AddWithValue("$dlqPath", $"{subPath}/$deadletterqueue");
             schedCmd.ExecuteNonQuery();
@@ -749,9 +958,7 @@ public class EntityManager : IDisposable
             _logger.LogWarning(ex, "Error disposing runtime structures for subscription {Topic}/{Sub}", topicName, name);
         }
 
-        string safeTopic = topicName.Replace("/", "_");
-        string safeSub = name.Replace("/", "_");
-        string subDir = Path.Combine(_dataDir, "entities", safeTopic, "subscriptions", safeSub);
+        string subDir = SubscriptionDirectory(topicName, name);
         if (Directory.Exists(subDir))
         {
             try
@@ -790,6 +997,7 @@ public class EntityManager : IDisposable
 
     public bool SaveRule(string topicName, string subName, RuleInfo rule)
     {
+        rule.NormalizeFilter();
         if (!_topics.TryGetValue(topicName, out var topic)) return false;
         var sub = topic.Subscriptions.Find(s => string.Equals(s.Name, subName, StringComparison.OrdinalIgnoreCase));
         if (sub == null) return false;
@@ -812,6 +1020,11 @@ public class EntityManager : IDisposable
             ";
             cmd.Parameters.AddWithValue("$topicName", topic.Name);
             cmd.Parameters.AddWithValue("$subName", sub.Name);
+            lock (sub.Rules)
+            {
+                if (sub.Rules.Find(r => string.Equals(r.Name, rule.Name, StringComparison.OrdinalIgnoreCase)) is { } stored)
+                    rule.Name = stored.Name; // SQLite compares names case-sensitively
+            }
             cmd.Parameters.AddWithValue("$ruleName", rule.Name);
             cmd.Parameters.AddWithValue("$filterType", rule.FilterType);
             cmd.Parameters.AddWithValue("$filterExpression", rule.FilterExpression ?? "");
@@ -833,12 +1046,50 @@ public class EntityManager : IDisposable
                 }
             }
 
+            sub.Activity.Record();
             return true;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to save rule {RuleName} for subscription {TopicName}/{SubName}", rule.Name, topicName, subName);
             return false;
+        }
+    }
+
+    /// <summary>A rule of a subscription by name (case-insensitively), or null if the subscription or rule does not exist.</summary>
+    public RuleInfo? GetRule(string topicName, string subName, string ruleName)
+    {
+        var sub = GetSubscription(topicName, subName);
+        if (sub == null) return null;
+        lock (sub.Rules) return sub.Rules.Find(r => string.Equals(r.Name, ruleName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>A snapshot of a subscription's rules, or null if the subscription does not exist.</summary>
+    public IReadOnlyList<RuleInfo>? GetRules(string topicName, string subName)
+    {
+        var sub = GetSubscription(topicName, subName);
+        if (sub == null) return null;
+        lock (sub.Rules) return sub.Rules.ToList();
+    }
+
+    /// <summary>Adds a rule. NotFound: no such subscription; Rejected: a rule of that name exists.</summary>
+    public UpdateOutcome CreateRule(string topicName, string subName, RuleInfo rule)
+    {
+        lock (_createLock)
+        {
+            if (GetSubscription(topicName, subName) is null) return UpdateOutcome.NotFound;
+            if (GetRule(topicName, subName, rule.Name) is not null) return UpdateOutcome.Rejected($"Rule '{rule.Name}' already exists.");
+            return SaveRule(topicName, subName, rule) ? UpdateOutcome.Applied : throw new InvalidOperationException($"Failed to persist rule '{rule.Name}'.");
+        }
+    }
+
+    /// <summary>Replaces an existing rule's filter and action. NotFound if the subscription or rule does not exist.</summary>
+    public UpdateOutcome UpdateRule(string topicName, string subName, RuleInfo rule)
+    {
+        lock (_createLock)
+        {
+            if (GetRule(topicName, subName, rule.Name) is null) return UpdateOutcome.NotFound;
+            return SaveRule(topicName, subName, rule) ? UpdateOutcome.Applied : throw new InvalidOperationException($"Failed to persist rule '{rule.Name}'.");
         }
     }
 
@@ -856,7 +1107,7 @@ public class EntityManager : IDisposable
         {
             var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
-            cmd.CommandText = "DELETE FROM Rules WHERE TopicName = $topicName AND SubscriptionName = $subName AND RuleName = $ruleName";
+            cmd.CommandText = "DELETE FROM Rules WHERE TopicName = $topicName AND SubscriptionName = $subName AND RuleName = $ruleName COLLATE NOCASE";
             cmd.Parameters.AddWithValue("$topicName", topic.Name);
             cmd.Parameters.AddWithValue("$subName", sub.Name);
             cmd.Parameters.AddWithValue("$ruleName", ruleName);
@@ -870,6 +1121,7 @@ public class EntityManager : IDisposable
                 {
                     sub.Rules.RemoveAll(r => string.Equals(r.Name, ruleName, StringComparison.OrdinalIgnoreCase));
                 }
+                sub.Activity.Record();
                 return true;
             }
             return false;
@@ -937,14 +1189,12 @@ public class EntityManager : IDisposable
                     long expiryTicks = header.EnqueueTimeUtcTicks + effectiveTtlTicks;
                     if (now.Ticks <= expiryTicks) continue;
 
-                    // Skip messages already in-flight; delivery-time check will handle them.
-                    if (dispatcher.IsTracked(address)) continue;
+                    // Only messages still waiting for their first delivery: in-flight ones are checked at delivery,
+                    // and records the delivery loop has passed (completed, or already retired) are not messages any more.
+                    if (!dispatcher.IsAwaitingFirstDelivery(address)) continue;
 
-                    _logger.LogInformation(
-                        "TTL expired for message seq={SeqNum} on entity {EntityName}, dead-lettering",
-                        header.SequenceNumber, entity.Name);
-
-                    await DeadLetterExpiredAsync(entity, address, data).ConfigureAwait(false);
+                    LogExpiry(entity, header.SequenceNumber);
+                    await RetireExpiredUndeliveredAsync(entity, address, data).ConfigureAwait(false);
                 }
             }
         }
@@ -955,29 +1205,39 @@ public class EntityManager : IDisposable
         }
     }
 
-    private async Task DeadLetterExpiredAsync(IMessageEntity entity, long address, byte[] data)
+    private void LogExpiry(IMessageEntity entity, long sequenceNumber) =>
+        _logger.LogInformation("Message seq={SeqNum} has expired (TTL) on entity {EntityName}; {Action}",
+            sequenceNumber, entity.Name, entity.DeadLetteringOnMessageExpiration ? "dead-lettering" : "discarding");
+
+    /// <summary>
+    /// Retires an expired message the delivery loop has not reached yet: dead-lettered if the entity has
+    /// DeadLetteringOnMessageExpiration, otherwise discarded. Either way the address is marked so the loop skips it.
+    /// </summary>
+    private async Task RetireExpiredUndeliveredAsync(IMessageEntity entity, long address, byte[] data)
     {
         var dispatcher = entity.Dispatcher;
-        var dlqStore = entity.DlqMessageStore;
-        if (dispatcher == null || dlqStore == null) return;
+        if (dispatcher == null) return;
 
+        if (!entity.DeadLetteringOnMessageExpiration)
+        {
+            dispatcher.MarkTtlExpired(address);
+            entity.DecrementMessageCount();
+            return;
+        }
+
+        if (entity.DlqMessageStore == null) return;
         try
         {
             var (header, message) = MessageSerializer.Decode(data);
-            var dlqHeader = header with { IsDeadLettered = true };
 
             message.ApplicationProperties ??= new ApplicationProperties();
-            message.ApplicationProperties["DeadLetterReason"] = "TTLExpiredException";
-            message.ApplicationProperties["DeadLetterErrorDescription"] = "The message has expired.";
+            message.ApplicationProperties[DeadLetterDetails.ReasonProperty] = DeadLetterDetails.TtlExpired.Reason;
+            message.ApplicationProperties[DeadLetterDetails.DescriptionProperty] = DeadLetterDetails.TtlExpired.Description;
 
-            byte[] encoded = MessageSerializer.Encode(message, dlqHeader);
-            await dlqStore.AppendAsync(encoded).ConfigureAwait(false);
+            await MoveToDeadLetterLogAsync(entity, header, message).ConfigureAwait(false);
 
             // Mark the address so the iterator skips it when it reaches this position.
             dispatcher.MarkTtlExpired(address);
-
-            entity.DecrementMessageCount();
-            entity.IncrementDeadLetterMessageCount();
         }
         catch (Exception ex)
         {
@@ -990,12 +1250,16 @@ public class EntityManager : IDisposable
         _ttlCts.Cancel();
         _schedulerCts.Cancel();
         _transactionCts.Cancel();
+        _autoDeleteCts.Cancel();
+        try { _autoDeleteTask.GetAwaiter().GetResult(); } catch { }
+        try { PersistActivity(); } catch (Exception ex) { _logger.LogWarning(ex, "Failed to store entity activity times on shutdown"); }
         try { _ttlTask.GetAwaiter().GetResult(); } catch { }
         try { _schedulerTask.GetAwaiter().GetResult(); } catch { }
         try { _transactionTask.GetAwaiter().GetResult(); } catch { }
         _ttlCts.Dispose();
         _schedulerCts.Dispose();
         _transactionCts.Dispose();
+        _autoDeleteCts.Dispose();
 
         foreach (var queue in _queues.Values)
         {
@@ -1020,6 +1284,7 @@ public class EntityManager : IDisposable
 
     public List<long> ScheduleMessages(string entityName, List<(byte[] payload, DateTime scheduledEnqueueTimeUtc)> messages)
     {
+        RecordActivity(entityName);
         var seqNumbers = new List<long>();
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
@@ -1087,7 +1352,7 @@ public class EntityManager : IDisposable
         connection.Open();
 
         var command = connection.CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM ScheduledMessages WHERE EntityName = @entityName";
+        command.CommandText = "SELECT COUNT(*) FROM ScheduledMessages WHERE EntityName = @entityName COLLATE NOCASE";
         command.Parameters.AddWithValue("@entityName", entityName);
 
         return Convert.ToInt32(command.ExecuteScalar());
@@ -1170,7 +1435,7 @@ public class EntityManager : IDisposable
 
                 try
                 {
-                    bool success = await EnqueueScheduledMessageAsync(msg.EntityName, msg.SequenceNumber, msg.Payload).ConfigureAwait(false);
+                    bool success = EnqueueScheduledMessage(msg.EntityName, msg.SequenceNumber, msg.Payload);
                     if (success)
                     {
                         DeleteScheduledMessage(msg.SequenceNumber);
@@ -1185,134 +1450,17 @@ public class EntityManager : IDisposable
         }
     }
 
-    private async Task<bool> EnqueueScheduledMessageAsync(string entityName, long seqNum, byte[] payload)
+    private bool EnqueueScheduledMessage(string entityName, long seqNum, byte[] payload)
     {
-        var queue = GetQueue(entityName);
-        if (queue != null)
-        {
-            await EnqueueToQueueAsync(queue, seqNum, payload).ConfigureAwait(false);
-            return true;
-        }
+        var message = Message.Decode(new ByteBuffer(payload, 0, payload.Length, payload.Length));
 
-        var topic = GetTopic(entityName);
-        if (topic != null)
-        {
-            await FanOutTopicScheduledMessageAsync(topic, seqNum, payload).ConfigureAwait(false);
+        // Queues keep the sequence number handed out at schedule time; topic fan-out assigns per-subscription numbers.
+        // Flush before returning: the caller deletes the scheduled row next.
+        if (Route(entityName, message, new RouteOptions(SequenceNumber: seqNum, Flush: true)))
             return true;
-        }
 
         _logger.LogWarning("Scheduled message target entity {EntityName} not found. Leaving in scheduled state.", entityName);
         return false;
-    }
-
-    private async Task EnqueueToQueueAsync(QueueInfo queue, long seqNum, byte[] payload)
-    {
-        var store = queue.MessageStore;
-        if (store == null) return;
-
-        var innerBuf = new ByteBuffer(payload, 0, payload.Length, payload.Length);
-        var message = Message.Decode(innerBuf);
-
-        long enqueueTicks = DateTime.UtcNow.Ticks;
-        var enqueuedTimeUtc = new DateTime(enqueueTicks, DateTimeKind.Utc);
-
-        message.MessageAnnotations ??= new MessageAnnotations();
-        message.MessageAnnotations[new Symbol("x-opt-sequence-number")] = seqNum;
-        message.MessageAnnotations[new Symbol("x-opt-enqueued-time-utc")] = enqueuedTimeUtc;
-        message.MessageAnnotations[new Symbol("x-opt-enqueued-time")] = enqueuedTimeUtc;
-
-        long ttlTicks = 0;
-        uint? msgTtlMs = message.Header?.Ttl;
-        if (msgTtlMs.HasValue && msgTtlMs.Value > 0)
-            ttlTicks = TimeSpan.FromMilliseconds(msgTtlMs.Value).Ticks;
-        else if (queue.DefaultMessageTimeToLive != TimeSpan.MaxValue)
-            ttlTicks = queue.DefaultMessageTimeToLive.Ticks;
-
-        var header = new MessageHeader
-        {
-            SequenceNumber = seqNum,
-            EnqueueTimeUtcTicks = enqueueTicks,
-            DeliveryCount = 0,
-            IsDeadLettered = false,
-            TimeToLiveTicks = ttlTicks
-        };
-
-        byte[] encoded = MessageSerializer.Encode(message, header);
-        await store.AppendAsync(encoded).ConfigureAwait(false);
-
-        // Thread-safe update NextSequenceNumber if seqNum is higher
-        queue.UpdateNextSequenceNumber(seqNum);
-
-        queue.IncrementMessageCount();
-    }
-
-    private async Task FanOutTopicScheduledMessageAsync(TopicInfo topic, long scheduledSeqNum, byte[] payload)
-    {
-        var innerBuf = new ByteBuffer(payload, 0, payload.Length, payload.Length);
-        var message = Message.Decode(innerBuf);
-
-        List<SubscriptionInfo> subs;
-        lock (topic.Subscriptions)
-        {
-            subs = new List<SubscriptionInfo>(topic.Subscriptions);
-        }
-
-        foreach (var sub in subs)
-        {
-            RuleInfo? matchedRule = null;
-            lock (sub.Rules)
-            {
-                foreach (var rule in sub.Rules)
-                {
-                    if (RuleEvaluator.Evaluate(rule, message))
-                    {
-                        matchedRule = rule;
-                        break;
-                    }
-                }
-            }
-
-            if (matchedRule == null) continue;
-
-            var store = sub.MessageStore;
-            if (store == null) continue;
-
-            long subSeqNum = sub.AssignNextSequenceNumber();
-            long enqueueTicks = DateTime.UtcNow.Ticks;
-            var enqueuedTimeUtc = new DateTime(enqueueTicks, DateTimeKind.Utc);
-
-            var messageToStore = new Message
-            {
-                Header = message.Header,
-                Properties = message.Properties,
-                ApplicationProperties = message.ApplicationProperties,
-                MessageAnnotations = message.MessageAnnotations ?? new MessageAnnotations(),
-                BodySection = message.BodySection
-            };
-            messageToStore.MessageAnnotations[new Symbol("x-opt-sequence-number")] = subSeqNum;
-            messageToStore.MessageAnnotations[new Symbol("x-opt-enqueued-time-utc")] = enqueuedTimeUtc;
-            messageToStore.MessageAnnotations[new Symbol("x-opt-enqueued-time")] = enqueuedTimeUtc;
-
-            long ttlTicks = 0;
-            uint? msgTtlMs = message.Header?.Ttl;
-            if (msgTtlMs.HasValue && msgTtlMs.Value > 0)
-                ttlTicks = TimeSpan.FromMilliseconds(msgTtlMs.Value).Ticks;
-            else if (sub.DefaultMessageTimeToLive != TimeSpan.MaxValue)
-                ttlTicks = sub.DefaultMessageTimeToLive.Ticks;
-
-            var header = new MessageHeader
-            {
-                SequenceNumber = subSeqNum,
-                EnqueueTimeUtcTicks = enqueueTicks,
-                DeliveryCount = 0,
-                IsDeadLettered = false,
-                TimeToLiveTicks = ttlTicks
-            };
-
-            byte[] encoded = MessageSerializer.Encode(messageToStore, header);
-            await store.AppendAsync(encoded).ConfigureAwait(false);
-            sub.IncrementMessageCount();
-        }
     }
 
     // ---------------- Session State & Locks Registry ----------------
@@ -1354,34 +1502,17 @@ public class EntityManager : IDisposable
 
     public SessionLockState? TryLockSession(string entityPath, string sessionId, string linkName, TimeSpan lockDuration, object? activeLink = null)
     {
-        var key = (entityPath, sessionId);
-        var now = DateTime.UtcNow;
-
-        if (_sessionLocks.TryGetValue(key, out var lockState) && lockState.LockedUntil > now)
+        while (true)
         {
-            if (lockState.ActiveLink is Amqp.Listener.ListenerLink existingLink && !existingLink.IsClosed)
+            if (_sessionLocks.TryGetValue((entityPath, sessionId), out var lockState)
+                && IsHeldByAnotherLink(lockState, linkName, DateTime.UtcNow))
             {
-                if (!string.Equals(lockState.LockedByLink, linkName, StringComparison.OrdinalIgnoreCase))
-                {
-                    return null;
-                }
+                return null;
             }
-
-            lockState.LockedByLink = linkName;
-            lockState.LockedUntil = now + lockDuration;
-            if (activeLink != null) lockState.ActiveLink = activeLink;
-            return lockState;
+            var claimed = TryClaimSession(entityPath, sessionId, linkName, lockDuration, activeLink ?? lockState?.ActiveLink);
+            if (claimed != null) return claimed;
+            // Another receiver changed the lock between the read and the claim: look again.
         }
-
-        var newLock = new SessionLockState
-        {
-            SessionId = sessionId,
-            LockedByLink = linkName,
-            LockedUntil = now + lockDuration,
-            ActiveLink = activeLink
-        };
-        _sessionLocks[key] = newLock;
-        return newLock;
     }
 
     public SessionLockState? TryLockNextAvailableSession(string entityPath, string linkName, TimeSpan lockDuration, object? activeLink = null)
@@ -1409,27 +1540,38 @@ public class EntityManager : IDisposable
 
             if (q.IsEmpty) continue;
 
-            var lockKey = (entityPath, sessionId);
-            if (_sessionLocks.TryGetValue(lockKey, out var lockState) && lockState.LockedUntil > now)
-            {
-                if (lockState.ActiveLink is Amqp.Listener.ListenerLink existingLink && !existingLink.IsClosed)
-                {
-                    continue;
-                }
-            }
-
-            var newLock = new SessionLockState
-            {
-                SessionId = sessionId,
-                LockedByLink = linkName,
-                LockedUntil = now + lockDuration,
-                ActiveLink = activeLink
-            };
-            _sessionLocks[lockKey] = newLock;
-            return newLock;
+            if (_sessionLocks.TryGetValue((entityPath, sessionId), out var lockState) && IsHeldByAnotherLink(lockState, linkName, now)) continue;
+            var claimed = TryClaimSession(entityPath, sessionId, linkName, lockDuration, activeLink);
+            if (claimed != null) return claimed;
         }
 
         return null;
+    }
+
+    /// <summary>A lock keeps other receivers out while it hasn't expired and its receive link is open.</summary>
+    private static bool IsHeldByAnotherLink(SessionLockState lockState, string linkName, DateTime now) =>
+        lockState.LockedUntil > now
+        && lockState.ActiveLink is Amqp.Listener.ListenerLink link && !link.IsClosed
+        && !string.Equals(lockState.LockedByLink, linkName, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Replaces the session's lock with one for <paramref name="linkName"/>, but only if nobody changed it since the
+    /// caller looked, so two receivers claiming the same session at once can't both win. Returns null if that happened.
+    /// </summary>
+    private SessionLockState? TryClaimSession(string entityPath, string sessionId, string linkName, TimeSpan lockDuration, object? activeLink)
+    {
+        var key = (entityPath, sessionId);
+        var newLock = new SessionLockState
+        {
+            SessionId = sessionId,
+            LockedByLink = linkName,
+            LockedUntil = DateTime.UtcNow + lockDuration,
+            ActiveLink = activeLink
+        };
+        bool claimed = _sessionLocks.TryGetValue(key, out var current)
+            ? !IsHeldByAnotherLink(current, linkName, DateTime.UtcNow) && _sessionLocks.TryUpdate(key, newLock, current)
+            : _sessionLocks.TryAdd(key, newLock);
+        return claimed ? newLock : null;
     }
 
     public bool ReleaseSessionLock(string entityPath, string sessionId, string linkName)
@@ -1445,18 +1587,18 @@ public class EntityManager : IDisposable
         return false;
     }
 
-    public bool RenewSessionLock(string entityPath, string sessionId, string linkName, TimeSpan lockDuration)
+    /// <summary>
+    /// Extends a session lock that hasn't expired, whichever receiver holds it: renewals arrive on the management
+    /// link, which can't say which receive link it speaks for. Returns the new expiry, or null if the lock is gone.
+    /// </summary>
+    public DateTime? RenewSessionLock(string entityPath, string sessionId, TimeSpan lockDuration)
     {
-        var key = (entityPath, sessionId);
-        if (_sessionLocks.TryGetValue(key, out var lockState) && lockState.LockedUntil > DateTime.UtcNow)
+        if (_sessionLocks.TryGetValue((entityPath, sessionId), out var lockState) && lockState.LockedUntil > DateTime.UtcNow)
         {
-            if (string.Equals(lockState.LockedByLink, linkName, StringComparison.OrdinalIgnoreCase))
-            {
-                lockState.LockedUntil = DateTime.UtcNow + lockDuration;
-                return true;
-            }
+            lockState.LockedUntil = DateTime.UtcNow + lockDuration;
+            return lockState.LockedUntil;
         }
-        return false;
+        return null;
     }
 
     public IEnumerable<string> GetActiveSessions(string entityPath)
@@ -1616,7 +1758,7 @@ public class EntityManager : IDisposable
         _logger.LogDebug("Buffered send on transaction {TxnId} for {EntityPath} (size={Size} bytes)", key, entityPath, size);
     }
 
-    public void BufferSettlement(byte[] txnId, Guid lockToken, object outcome, string? dlReason = null, string? dlDescription = null)
+    public void BufferSettlement(byte[] txnId, Guid lockToken, object outcome, DeadLetterDetails? deadLetter = null)
     {
         var key = Convert.ToHexString(txnId);
         if (!_transactions.TryGetValue(key, out var state))
@@ -1631,7 +1773,7 @@ public class EntityManager : IDisposable
         if (state.Sends.Count + state.Settlements.Count >= 1000)
             throw new AmqpException(new Error(ErrorCode.ResourceLimitExceeded) { Description = "Transaction operation count limit (1000) exceeded." });
 
-        state.Settlements.Add(new BufferedSettlement(lockToken, outcome, dlReason, dlDescription));
+        state.Settlements.Add(new BufferedSettlement(lockToken, outcome, deadLetter));
         state.LastActive = DateTime.UtcNow;
         _logger.LogDebug("Buffered settlement on transaction {TxnId} for lock {LockToken}", key, lockToken);
     }
@@ -1663,29 +1805,16 @@ public class EntityManager : IDisposable
         // 1. Process sends
         foreach (var send in state.Sends)
         {
-            var queue = GetQueue(send.EntityPath);
-            if (queue != null)
+            if (!Route(send.EntityPath, send.Message, new RouteOptions(ToDeadLetter: send.IsDlq)))
             {
-                CommitSendToQueue(queue, send.Message, send.IsDlq);
-            }
-            else
-            {
-                var topic = GetTopic(send.EntityPath);
-                if (topic != null)
-                {
-                    CommitSendToTopic(topic, send.Message);
-                }
-                else
-                {
-                    _logger.LogWarning("Entity {EntityPath} not found for buffered send during commit", send.EntityPath);
-                }
+                _logger.LogWarning("Entity {EntityPath} not found for buffered send during commit", send.EntityPath);
             }
         }
 
         // 2. Process settlements
         foreach (var settle in state.Settlements)
         {
-            ApplySettlement(settle.LockToken, settle.Outcome, settle.DeadLetterReason, settle.DeadLetterDescription);
+            ApplySettlement(settle.LockToken, settle.Outcome, settle.DeadLetter);
         }
     }
 
@@ -1698,162 +1827,7 @@ public class EntityManager : IDisposable
         }
     }
 
-    private void CommitSendToQueue(QueueInfo queue, Message message, bool isDlq)
-    {
-        var store = isDlq ? queue.DlqMessageStore : queue.MessageStore;
-        if (store == null) return;
-
-        long seqNum = queue.AssignNextSequenceNumber();
-        long enqueueTicks = DateTime.UtcNow.Ticks;
-        long ttlTicks = 0;
-
-        uint? msgTtlMs = message.Header?.Ttl;
-        if (msgTtlMs.HasValue && msgTtlMs.Value > 0)
-            ttlTicks = TimeSpan.FromMilliseconds(msgTtlMs.Value).Ticks;
-        else if (queue.DefaultMessageTimeToLive != TimeSpan.MaxValue)
-            ttlTicks = queue.DefaultMessageTimeToLive.Ticks;
-
-        var messageToStore = new Message
-        {
-            Header = message.Header,
-            Properties = message.Properties,
-            ApplicationProperties = message.ApplicationProperties,
-            MessageAnnotations = message.MessageAnnotations ?? new MessageAnnotations(),
-            BodySection = message.BodySection
-        };
-        messageToStore.MessageAnnotations[new Symbol("x-opt-sequence-number")] = seqNum;
-        var enqueuedTimeUtc = new DateTime(enqueueTicks, DateTimeKind.Utc);
-        messageToStore.MessageAnnotations[new Symbol("x-opt-enqueued-time-utc")] = enqueuedTimeUtc;
-        messageToStore.MessageAnnotations[new Symbol("x-opt-enqueued-time")] = enqueuedTimeUtc;
-
-        var header = new MessageHeader
-        {
-            SequenceNumber = seqNum,
-            EnqueueTimeUtcTicks = enqueueTicks,
-            DeliveryCount = 0,
-            IsDeadLettered = isDlq,
-            TimeToLiveTicks = ttlTicks
-        };
-
-        byte[] encoded = MessageSerializer.Encode(messageToStore, header);
-        long address = store.Append(encoded);
-
-        if (isDlq) queue.IncrementDeadLetterMessageCount();
-        else queue.IncrementMessageCount();
-
-        string? sessionId = message.Properties?.GroupId;
-        if (!isDlq && queue.RequiresSession && !string.IsNullOrEmpty(sessionId))
-        {
-            var q = queue.SessionMessageAddresses.GetOrAdd(sessionId, _ => new ConcurrentQueue<long>());
-            q.Enqueue(address);
-        }
-    }
-
-    private void CommitSendToTopic(TopicInfo topic, Message message)
-    {
-        List<SubscriptionInfo> subs;
-        lock (topic.Subscriptions)
-        {
-            subs = new List<SubscriptionInfo>(topic.Subscriptions);
-        }
-
-        foreach (var sub in subs)
-        {
-            RuleInfo? matchedRule = null;
-            lock (sub.Rules)
-            {
-                foreach (var rule in sub.Rules)
-                {
-                    if (RuleEvaluator.Evaluate(rule, message))
-                    {
-                        matchedRule = rule;
-                        break;
-                    }
-                }
-            }
-
-            if (matchedRule == null) continue;
-
-            var subStore = sub.MessageStore;
-            if (subStore == null) continue;
-
-            try
-            {
-                long seqNum = sub.AssignNextSequenceNumber();
-                long enqueueTicks = DateTime.UtcNow.Ticks;
-                long ttlTicks = 0;
-
-                uint? msgTtlMs = message.Header?.Ttl;
-                if (msgTtlMs.HasValue && msgTtlMs.Value > 0)
-                    ttlTicks = TimeSpan.FromMilliseconds(msgTtlMs.Value).Ticks;
-                else if (sub.DefaultMessageTimeToLive != TimeSpan.MaxValue)
-                    ttlTicks = sub.DefaultMessageTimeToLive.Ticks;
-
-                var messageToStore = new Message
-                {
-                    Header = message.Header,
-                    Properties = message.Properties,
-                    ApplicationProperties = message.ApplicationProperties ?? new ApplicationProperties(),
-                    MessageAnnotations = message.MessageAnnotations ?? new MessageAnnotations(),
-                    BodySection = message.BodySection
-                };
-                messageToStore.MessageAnnotations[new Symbol("x-opt-sequence-number")] = seqNum;
-                var enqueuedTimeUtc = new DateTime(enqueueTicks, DateTimeKind.Utc);
-                messageToStore.MessageAnnotations[new Symbol("x-opt-enqueued-time-utc")] = enqueuedTimeUtc;
-                messageToStore.MessageAnnotations[new Symbol("x-opt-enqueued-time")] = enqueuedTimeUtc;
-
-                if (sub.RequiresSession && string.IsNullOrEmpty(message.Properties?.GroupId))
-                {
-                    var subDlqStore = sub.DlqMessageStore;
-                    if (subDlqStore != null)
-                    {
-                        messageToStore.ApplicationProperties["DeadLetterReason"] = "SessionIdIsNull";
-                        messageToStore.ApplicationProperties["DeadLetterErrorDescription"] = "The SessionId was not set on a message sent to a session-enabled entity.";
-
-                        var header = new MessageHeader
-                        {
-                            SequenceNumber = seqNum,
-                            EnqueueTimeUtcTicks = enqueueTicks,
-                            DeliveryCount = 0,
-                            IsDeadLettered = true,
-                            TimeToLiveTicks = ttlTicks
-                        };
-
-                        byte[] encoded = MessageSerializer.Encode(messageToStore, header);
-                        subDlqStore.Append(encoded);
-                        sub.IncrementDeadLetterMessageCount();
-                    }
-                    continue;
-                }
-
-                var headerNormal = new MessageHeader
-                {
-                    SequenceNumber = seqNum,
-                    EnqueueTimeUtcTicks = enqueueTicks,
-                    DeliveryCount = 0,
-                    IsDeadLettered = false,
-                    TimeToLiveTicks = ttlTicks
-                };
-
-                byte[] encodedNormal = MessageSerializer.Encode(messageToStore, headerNormal);
-                long address = subStore.Append(encodedNormal);
-                sub.IncrementMessageCount();
-
-                string? sessionId = message.Properties?.GroupId;
-                if (sub.RequiresSession && !string.IsNullOrEmpty(sessionId))
-                {
-                    var q = sub.SessionMessageAddresses.GetOrAdd(sessionId, _ => new ConcurrentQueue<long>());
-                    q.Enqueue(address);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to fan out transaction message from topic {TopicName} to subscription {SubName}", topic.Name, sub.Name);
-            }
-        }
-    }
-
-    private void ApplySettlement(Guid lockToken, object outcome, string? dlReason, string? dlDescription)
+    private void ApplySettlement(Guid lockToken, object outcome, DeadLetterDetails? deadLetter)
     {
         if (!TryRemoveLock(lockToken, out var lockState))
         {
@@ -1928,16 +1902,24 @@ public class EntityManager : IDisposable
                 break;
             case "abandoned":
                 dispatcher.IncrementDeliveryCount(lockState.LogAddress);
-                dispatcher.Abandon(lockState.LogAddress, lockToken);
+                dispatcher.Abandon(lockState.LogAddress, lockToken, SettlementProperties(outcome, deadLetter));
                 break;
             case "suspended":
-                DeadLetterMessageAsync(entity, lockState.LogAddress, dlReason, dlDescription).GetAwaiter().GetResult();
+                // A transactional link disposition carries its details in the Rejected outcome; management supplies them.
+                var details = outcome is Amqp.Framing.Rejected rejected ? DeadLetterDetails.FromRejected(rejected) : deadLetter ?? DeadLetterDetails.None;
+                DeadLetterMessageAsync(entity, lockState.LogAddress, details).GetAwaiter().GetResult();
                 break;
             case "defered":
-                dispatcher.Defer(lockState.LogAddress, lockToken, lockState.SequenceNumber);
+                dispatcher.Defer(lockState.LogAddress, lockToken, lockState.SequenceNumber, SettlementProperties(outcome, deadLetter));
                 break;
         }
     }
+
+    /// <summary>A transactional link settlement carries properties to modify in its Modified outcome; management supplies them.</summary>
+    private static IReadOnlyDictionary<string, object?> SettlementProperties(object outcome, DeadLetterDetails? managementDetails) =>
+        outcome is Amqp.Framing.Modified modified
+            ? PropertiesToModify.FromModified(modified)
+            : managementDetails?.PropertiesToModify ?? PropertiesToModify.None;
 
     private async Task RunTransactionTimeoutScanLoopAsync(CancellationToken cancellationToken)
     {

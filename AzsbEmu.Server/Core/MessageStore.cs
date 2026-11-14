@@ -12,11 +12,11 @@ public class MessageStore : IDisposable
     private readonly CancellationTokenSource _commitCts = new();
     private readonly Task _commitTask;
 
-    public MessageStore(string logPath, ILogger logger)
+    public MessageStore(string logPath, ILogger logger, string? commitDir = null)
     {
         _logger = logger;
         _device = Devices.CreateLogDevice(logPath);
-        _log = new FasterLog(new FasterLogSettings { LogDevice = _device });
+        _log = new FasterLog(new FasterLogSettings { LogDevice = _device, LogCommitDir = commitDir });
         _commitTask = RunCommitLoopAsync(_commitCts.Token);
     }
 

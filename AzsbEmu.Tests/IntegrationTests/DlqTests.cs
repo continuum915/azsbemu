@@ -72,6 +72,81 @@ public class DlqTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task DeadLetterMessage_AppliesPropertiesToModify_AndUsesOnlyAGivenReason()
+    {
+        _broker.EnsureQueue("dlq-props");
+        await using (var sender = _client.CreateSender("dlq-props"))
+        {
+            await sender.SendMessageAsync(new ServiceBusMessage("with-reason") { ApplicationProperties = { ["kept"] = "yes" } });
+            await sender.SendMessageAsync(new ServiceBusMessage("no-reason"));
+        }
+
+        await using (var receiver = _client.CreateReceiver("dlq-props"))
+        {
+            var first = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+            await receiver.DeadLetterMessageAsync(first!, new Dictionary<string, object> { ["fault"] = "boom", ["attempts"] = 3 }, "Broken", "it broke");
+            var second = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+            await receiver.DeadLetterMessageAsync(second!);
+        }
+
+        await using var dlq = _client.CreateReceiver("dlq-props", new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+        var withReason = await dlq.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("Broken", withReason!.DeadLetterReason);
+        Assert.Equal("it broke", withReason.DeadLetterErrorDescription);
+        Assert.Equal("boom", withReason.ApplicationProperties["fault"]);
+        Assert.Equal(3, withReason.ApplicationProperties["attempts"]);
+        Assert.Equal("yes", withReason.ApplicationProperties["kept"]);
+
+        var noReason = await dlq.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("no-reason", noReason?.Body.ToString());
+        Assert.Null(noReason!.DeadLetterReason);
+    }
+
+    [Fact]
+    public async Task TransactionalDeadLetter_KeepsReasonAndPropertiesToModify()
+    {
+        _broker.EnsureQueue("dlq-txn");
+        await using (var sender = _client.CreateSender("dlq-txn"))
+            await sender.SendMessageAsync(new ServiceBusMessage("in-txn"));
+
+        await using (var receiver = _client.CreateReceiver("dlq-txn"))
+        {
+            var message = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+            using var scope = new System.Transactions.TransactionScope(System.Transactions.TransactionScopeAsyncFlowOption.Enabled);
+            await receiver.DeadLetterMessageAsync(message!, new Dictionary<string, object> { ["fault"] = "txn" }, "TxnReason", "txn description");
+            scope.Complete();
+        }
+
+        await using var dlq = _client.CreateReceiver("dlq-txn", new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+        var deadLettered = await dlq.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("TxnReason", deadLettered!.DeadLetterReason);
+        Assert.Equal("txn description", deadLettered.DeadLetterErrorDescription);
+        Assert.Equal("txn", deadLettered.ApplicationProperties["fault"]);
+    }
+
+    [Fact]
+    public async Task DeadLetteringADeferredMessage_KeepsReasonAndPropertiesToModify()
+    {
+        // Deferred messages are settled through the management link (update-disposition).
+        _broker.EnsureQueue("dlq-deferred");
+        await using (var sender = _client.CreateSender("dlq-deferred"))
+            await sender.SendMessageAsync(new ServiceBusMessage("deferred"));
+
+        await using (var receiver = _client.CreateReceiver("dlq-deferred"))
+        {
+            var message = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+            await receiver.DeferMessageAsync(message!);
+            var deferred = await receiver.ReceiveDeferredMessageAsync(message!.SequenceNumber);
+            await receiver.DeadLetterMessageAsync(deferred, new Dictionary<string, object> { ["fault"] = "deferred" }, "DeferredReason", "deferred description");
+        }
+
+        await using var dlq = _client.CreateReceiver("dlq-deferred", new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+        var deadLettered = await dlq.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("DeferredReason", deadLettered!.DeadLetterReason);
+        Assert.Equal("deferred", deadLettered.ApplicationProperties["fault"]);
+    }
+
     public void Dispose()
     {
         _client.DisposeAsync().AsTask().GetAwaiter().GetResult();

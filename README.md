@@ -1,90 +1,64 @@
-# AzsbEmu — Azure Service Bus Local Emulator
+# AzsbEmu
 
-**AzsbEmu** is a lightweight, high-performance, and fully persistent local emulator for Azure Service Bus. It is built in C# for .NET 10 to overcome the entity limits and state-recovery gaps of alternative options, making it ideal for local development, rapid developer feedback, and automated integration testing pipelines.
+A local Azure Service Bus emulator for development and integration tests. It speaks AMQP 1.0 and the Service Bus HTTP management API, so `Azure.Messaging.ServiceBus` (sending, receiving, and `ServiceBusAdministrationClient`) and MassTransit work against it unmodified. Entities and messages persist across restarts.
 
----
+## Run
 
-## Key Features
+```bash
+docker run -d --name azsbemu -p 5672:5672 -p 80:8080 -v azsbemu-data:/app/data ghcr.io/continuum915/azsbemu:latest
+```
 
-- **Unlimited Entities:** Support for 500+ active queues, topics, and subscriptions without runtime degradation.
-- **Durable Persistence:** Survives application restarts and system crashes.
-  - **Metadata (SQLite):** Durable, transaction-protected metadata storage for entity definitions and subscription rule filters.
-  - **Message Streams (Microsoft FASTER Log):** Persistent, append-only, high-performance stream storage serving as the sole source of truth for message data.
-- **Feature Compatibility Scope:**
-  - **Dynamic Entity Management ($management):** Create and delete queues, topics, and subscriptions dynamically at runtime without restarting.
-  - **Basic Messaging:** Send, receive, PeekLock, receive-and-delete, and standard correlation or SQL filters.
-  - **Scheduled Messages:** Schedule delayed deliveries (`com.microsoft:schedule-message` and `x-opt-scheduled-enqueue-time` annotation sends).
-  - **Deferred Messages:** Deferred message delivery and retrieval by sequence number (`com.microsoft:receive-by-sequence-number`).
-  - **Expiration / TTL:** Automated message time-to-live enforcement with background dead-lettering (`TTLExpiredException`).
-  - **Claims-Based Security ($cbs):** Integrated SASL Claims-Based Security authentication handshake.
+Pin a version tag (for example `:0.1.0`) in shared setups. Images are built for amd64 and arm64.
 
----
-
-## Getting Started
-
-### 1. Connection String
-To connect your Azure SDK clients (`Azure.Messaging.ServiceBus` in .NET, Java, Python, or JS) to the emulator, configure your client using the following local connection string:
+## Connect
 
 ```text
 Endpoint=sb://localhost/;SharedAccessKeyName=Root;SharedAccessKey=dummy;UseDevelopmentEmulator=true
 ```
 
-*(Note: When running on a custom port like `5672`, standard SDK clients automatically resolve it. No port overrides are required unless you change it via the port options below).*
+Leave the port out of the endpoint. The client then uses AMQP on 5672 and the administration client uses HTTP on 80, so one string drives both. This needs Azure.Messaging.ServiceBus 7.18 or later.
 
----
+## MassTransit
 
-### 2. Configuration & CLI Parameters
-AzsbEmu can be configured using environment variables (prefixed with `AZSB_EMU_`), command-line arguments, or `appsettings.json`.
-
-| CLI Option | Environment Variable | Default Value | Description |
-| :--- | :--- | :--- | :--- |
-| `--host` | `AZSB_EMU_HOST` | `localhost` | The host address to listen on. |
-| `--port` | `AZSB_EMU_PORT` | `5672` | The port address to listen on. |
-| `--data-dir` | `AZSB_EMU_DATA_DIR` | `%LOCALAPPDATA%/AzsbEmu` | Path where SQLite database and FASTER logs are persisted. |
-
----
-
-### 3. Deployments & Running
-
-#### Option A: Running from Source (.NET 10 SDK)
-To start the emulator directly from your local source code:
-```powershell
-dotnet run --project AzsbEmu.Server/AzsbEmu.Server.csproj
+```csharp
+x.UsingAzureServiceBus((context, cfg) =>
+{
+    cfg.Host("Endpoint=sb://localhost/;SharedAccessKeyName=Root;SharedAccessKey=dummy;UseDevelopmentEmulator=true");
+    cfg.ConfigureEndpoints(context);
+});
 ```
 
-#### Option B: Self-Contained Executable (Windows)
-For standalone distribution without requiring .NET installed, compile a single-file executable:
-```powershell
-# Compile the single-file binary
-dotnet publish AzsbEmu.Server/AzsbEmu.Server.csproj -r win-x64 -c Release --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=true -o ./publish/win-x64
+- **MassTransit 8** deploys its topology and runs as-is.
+- **MassTransit 7.3** works too, and interoperates with MassTransit 8 on the same emulator. Add a direct reference to `Azure.Messaging.ServiceBus` 7.21.0, since MassTransit 7.3 alone resolves an SDK too old for `UseDevelopmentEmulator`.
+- **MassTransit 7.0–7.2** is not supported: those versions use an older SDK that requires TLS.
 
-# Start the executable directly
-./publish/win-x64/AzsbEmu.Server.exe
-```
+## Supported
 
-#### Option C: Containerized (Docker)
-Build and run the emulator inside a lightweight, sandboxed container:
-```powershell
-# Build the docker image
-docker build -t azsbemu:latest .
+- Queues, topics, subscriptions, and rules (SQL and correlation filters, SQL rule actions), over the HTTP API or AMQP
+- Peek-lock and receive-and-delete; complete, abandon, defer, and dead-letter; lock renewal
+- Sessions, transactions, scheduled messages, and message TTL
+- Auto-forwarding, duplicate detection, and auto-delete on idle
 
-# Run the container with a persistent directory mount
-docker run -d -p 5672:5672 -v azsbemu-data:/app/data --name azsbemu azsbemu:latest
-```
+## Known gaps
 
----
+- Delivery counts, properties changed by abandon or defer, and the duplicate detection history are held in memory. A restart resets them.
+- Partitioning, size limits, and entity status are stored but not enforced. `SizeInBytes` is always 0.
+- No TLS, no authentication, and a 1 MB maximum message size.
 
-## Development & Verification
+## Configure
 
-### Running the Test Suite
-The solution contains extensive xUnit integration tests covering message serialization, scheduled deliveries, dynamic CRUD topology changes, TTL expiration, and recovery:
-```powershell
+| Setting | Environment variable | Default (container) |
+| :--- | :--- | :--- |
+| Listen address | `AZSB_EMU_Host` | `0.0.0.0` |
+| AMQP port | `AZSB_EMU_Port` | `5672` |
+| HTTP management port | `AZSB_EMU_HttpPort` | `8080` (publish as host port 80) |
+| Data directory | `AZSB_EMU_DataDirectory` | `/app/data` |
+
+## Build and test
+
+```bash
+dotnet run --project AzsbEmu.Server
 dotnet test AzsbEmu.slnx
 ```
 
----
-
-## Known Functional Gaps & Future Roadmap
-- **Phase 4 Target:** Message Sessions (`RequiresSession = true` support, accept-session lock logic, and session state tracking).
-- **Phase 4 Target:** Lock Renewal (`com.microsoft:renew-lock`).
-- **Phase 4 Target:** Distributed Transaction Support (`$coordinator` transaction controller).
+Published images come from `.github/workflows/docker-publish.yml` when a `v*.*.*` tag is pushed.

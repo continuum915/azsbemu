@@ -82,38 +82,7 @@ public class EntityLinkProcessor : ILinkProcessor
         var queue = _entityManager.GetQueue(baseAddress);
         if (queue != null)
         {
-            string? sessionId = null;
-            if (isReceiver && !isDlq && queue.RequiresSession)
-            {
-                sessionId = ExtractSessionId(context.Attach);
-                if (string.IsNullOrEmpty(sessionId))
-                {
-                    _logger.LogWarning("Rejecting receiver attach to session-enabled queue '{Address}': Session ID is missing", baseAddress);
-                    context.Complete(new Error(ErrorCode.PreconditionFailed) { Description = "It is not possible to create a receiver on a session-enabled entity without a session." });
-                    return;
-                }
-
-                var lockDuration = queue.LockDuration;
-                var lockState = _entityManager.TryLockSession(baseAddress, sessionId, context.Attach.LinkName, lockDuration);
-                if (lockState == null)
-                {
-                    _logger.LogWarning("Rejecting receiver attach to session-enabled queue '{Address}': Session '{SessionId}' is already locked", baseAddress, sessionId);
-                    context.Complete(new Error(ErrorCode.NotAllowed) { Description = $"Session '{sessionId}' is already locked by another receiver." });
-                    return;
-                }
-
-                context.Attach.Properties ??= new Fields();
-                context.Attach.Properties[new Symbol("com.microsoft:session-id")] = sessionId;
-
-                if (context.Attach.Source is Source sourceVal)
-                {
-                    sourceVal.FilterSet ??= new Map();
-                    sourceVal.FilterSet[new Symbol("com.microsoft:session-filter")] = sessionId;
-                }
-            }
-
-            bool isReceiveAndDelete = isReceiver && context.Attach.RcvSettleMode == ReceiverSettleMode.First;
-            context.Complete(new EntityLinkEndpoint(queue, baseAddress, _entityManager, isReceiveAndDelete, isDlq, sessionId, _logger), 300);
+            AttachEntityLink(context, queue, baseAddress, isReceiver, isDlq);
             return;
         }
 
@@ -128,38 +97,7 @@ public class EntityLinkProcessor : ILinkProcessor
                 var sub = topic.Subscriptions.Find(s => string.Equals(s.Name, subName, StringComparison.OrdinalIgnoreCase));
                 if (sub != null)
                 {
-                    string? sessionId = null;
-                    if (isReceiver && !isDlq && sub.RequiresSession)
-                    {
-                        sessionId = ExtractSessionId(context.Attach);
-                        if (string.IsNullOrEmpty(sessionId))
-                        {
-                            _logger.LogWarning("Rejecting receiver attach to session-enabled subscription '{Address}': Session ID is missing", baseAddress);
-                            context.Complete(new Error(ErrorCode.PreconditionFailed) { Description = "It is not possible to create a receiver on a session-enabled entity without a session." });
-                            return;
-                        }
-
-                        var lockDuration = sub.LockDuration;
-                        var lockState = _entityManager.TryLockSession(baseAddress, sessionId, context.Attach.LinkName, lockDuration);
-                        if (lockState == null)
-                        {
-                            _logger.LogWarning("Rejecting receiver attach to session-enabled subscription '{Address}': Session '{SessionId}' is already locked", baseAddress, sessionId);
-                            context.Complete(new Error(ErrorCode.NotAllowed) { Description = $"Session '{sessionId}' is already locked by another receiver." });
-                            return;
-                        }
-
-                        context.Attach.Properties ??= new Fields();
-                        context.Attach.Properties[new Symbol("com.microsoft:session-id")] = sessionId;
-
-                        if (context.Attach.Source is Source sourceVal)
-                        {
-                            sourceVal.FilterSet ??= new Map();
-                            sourceVal.FilterSet[new Symbol("com.microsoft:session-filter")] = sessionId;
-                        }
-                    }
-
-                    bool isReceiveAndDelete = isReceiver && context.Attach.RcvSettleMode == ReceiverSettleMode.First;
-                    context.Complete(new EntityLinkEndpoint(sub, baseAddress, _entityManager, isReceiveAndDelete, isDlq, sessionId, _logger), 300);
+                    AttachEntityLink(context, sub, baseAddress, isReceiver, isDlq);
                     return;
                 }
             }
@@ -190,6 +128,118 @@ public class EntityLinkProcessor : ILinkProcessor
 
         _logger.LogWarning("Entity '{Address}' not found", address);
         context.Complete(new Error(ErrorCode.NotFound) { Description = $"Entity '{address}' not found" });
+    }
+
+    private void AttachEntityLink(AttachContext context, IMessageEntity entity, string entityPath, bool isReceiver, bool isDlq)
+    {
+        if (!isReceiver || isDlq || !entity.RequiresSession)
+        {
+            CompleteEntityLink(context, entity, entityPath, isReceiver, isDlq, sessionLock: null);
+            return;
+        }
+
+        string? sessionId = ExtractSessionId(context.Attach);
+        if (string.IsNullOrEmpty(sessionId))
+        {
+            _ = AttachToNextAvailableSessionAsync(context, entity, entityPath);
+            return;
+        }
+
+        var sessionLock = _entityManager.TryLockSession(entityPath, sessionId, context.Attach.LinkName, entity.LockDuration, context.Link);
+        if (sessionLock == null)
+        {
+            _logger.LogWarning("Rejecting receiver attach to '{Address}': Session '{SessionId}' is already locked", entityPath, sessionId);
+            context.Complete(new Error(ErrorCode.NotAllowed) { Description = $"Session '{sessionId}' is already locked by another receiver." });
+            return;
+        }
+
+        CompleteEntityLink(context, entity, entityPath, isReceiver: true, isDlq: false, sessionLock);
+    }
+
+    /// <summary>
+    /// A session receiver that names no session gets the next session with messages that no other receiver holds.
+    /// Like Service Bus, the attach waits for one until the client's timeout and then fails with a timeout error.
+    /// </summary>
+    private async Task AttachToNextAvailableSessionAsync(AttachContext context, IMessageEntity entity, string entityPath)
+    {
+        var link = context.Link;
+        var deadline = DateTime.UtcNow + AttachTimeout(context.Attach);
+        HeldAttach.Hold(link);
+        try
+        {
+            while (!link.IsClosed)
+            {
+                var lockState = _entityManager.TryLockNextAvailableSession(entityPath, context.Attach.LinkName, entity.LockDuration, link);
+                if (lockState != null)
+                {
+                    if (HeldAttach.TryAnswer(link, () => CompleteEntityLink(context, entity, entityPath, isReceiver: true, isDlq: false, lockState)))
+                    {
+                        _logger.LogDebug("Receiver '{LinkName}' on '{Address}' accepted session '{SessionId}'", context.Attach.LinkName, entityPath, lockState.SessionId);
+                    }
+                    else
+                    {
+                        _entityManager.ReleaseSessionLock(entityPath, lockState.SessionId, context.Attach.LinkName);
+                    }
+                    return;
+                }
+
+                if (DateTime.UtcNow >= deadline)
+                {
+                    HeldAttach.TryAnswer(link, () => context.Complete(new Error(TimeoutSymbol)
+                    {
+                        Description = $"No session on '{entityPath}' became available before the timeout."
+                    }));
+                    return;
+                }
+                await Task.Delay(NextSessionPollInterval);
+            }
+            _logger.LogDebug("Receiver '{LinkName}' on '{Address}' detached while waiting for a session", context.Attach.LinkName, entityPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Accepting the next available session on '{Address}' failed", entityPath);
+            HeldAttach.TryAnswer(link, () => context.Complete(new Error(ErrorCode.InternalError) { Description = ex.Message }));
+        }
+    }
+
+    private static readonly Symbol TimeoutSymbol = new("com.microsoft:timeout");
+    private static readonly Symbol SessionIdProperty = new("com.microsoft:session-id");
+    private static readonly Symbol SessionFilter = new("com.microsoft:session-filter");
+    private static readonly Symbol LockedUntilUtcProperty = new("com.microsoft:locked-until-utc");
+    private static readonly TimeSpan NextSessionPollInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan DefaultAttachTimeout = TimeSpan.FromSeconds(60);
+
+    /// <summary>The client's operation timeout, sent as the <c>com.microsoft:timeout</c> link property in milliseconds.</summary>
+    private static TimeSpan AttachTimeout(Attach attach)
+    {
+        return attach.Properties?[TimeoutSymbol] switch
+        {
+            uint ms => TimeSpan.FromMilliseconds(ms),
+            int ms when ms > 0 => TimeSpan.FromMilliseconds(ms),
+            long ms when ms > 0 => TimeSpan.FromMilliseconds(ms),
+            _ => DefaultAttachTimeout,
+        };
+    }
+
+    private void CompleteEntityLink(AttachContext context, IMessageEntity entity, string entityPath, bool isReceiver, bool isDlq, SessionLockState? sessionLock)
+    {
+        if (sessionLock != null)
+        {
+            // The client learns which session it holds, and until when, from the attach the broker sends back.
+            context.Attach.Properties ??= new Fields();
+            context.Attach.Properties[SessionIdProperty] = sessionLock.SessionId;
+            context.Attach.Properties[LockedUntilUtcProperty] = sessionLock.LockedUntil.Ticks;
+            if (context.Attach.Source is Source source)
+            {
+                source.FilterSet ??= new Map();
+                source.FilterSet[SessionFilter] = sessionLock.SessionId;
+            }
+        }
+
+        bool isReceiveAndDelete = isReceiver && context.Attach.RcvSettleMode == ReceiverSettleMode.First;
+        // An attached receiver keeps the entity from being auto-deleted as idle.
+        if (isReceiver) entity.Activity.ReceiverAttached(context.Link);
+        context.Complete(new EntityLinkEndpoint(entity, entityPath, _entityManager, isReceiveAndDelete, isDlq, sessionLock?.SessionId, _logger), 300);
     }
 
     private static bool IsReplyToLinkCandidate(string? linkName, string address)
@@ -239,10 +289,6 @@ public class EntityLinkProcessor : ILinkProcessor
 
 public class TopicLinkEndpoint : LinkEndpoint
 {
-    private static readonly Symbol SequenceNumberAnnotation = new("x-opt-sequence-number");
-    private static readonly Symbol EnqueuedTimeUtcAnnotation = new("x-opt-enqueued-time-utc");
-    private static readonly Symbol EnqueuedTimeAnnotation = new("x-opt-enqueued-time");
-
     private readonly TopicInfo _topic;
     private readonly EntityManager _entityManager;
     private readonly ILogger _logger;
@@ -344,7 +390,7 @@ public class TopicLinkEndpoint : LinkEndpoint
                     }
                     else
                     {
-                        FanOutToSubscriptions(innerMsg);
+                        _entityManager.Route(_topic, innerMsg);
                     }
                 }
                 catch (Exception ex)
@@ -362,138 +408,12 @@ public class TopicLinkEndpoint : LinkEndpoint
             }
             else
             {
-                FanOutToSubscriptions(outerMessage);
+                _entityManager.Route(_topic, outerMessage);
             }
         }
 
         messageContext.Complete();
     }
-
-    private void FanOutToSubscriptions(Message message)
-    {
-        List<SubscriptionInfo> subs;
-        lock (_topic.Subscriptions)
-        {
-            subs = new List<SubscriptionInfo>(_topic.Subscriptions);
-        }
-
-        foreach (var sub in subs)
-        {
-            RuleInfo? matchedRule = null;
-            lock (sub.Rules)
-            {
-                foreach (var rule in sub.Rules)
-                {
-                    if (RuleEvaluator.Evaluate(rule, message))
-                    {
-                        matchedRule = rule;
-                        break;
-                    }
-                }
-            }
-
-            if (matchedRule == null)
-            {
-                _logger.LogDebug("Message does not match rules for subscription {SubName} on topic {TopicName}", sub.Name, _topic.Name);
-                continue;
-            }
-
-            var subStore = sub.MessageStore;
-            if (subStore == null)
-            {
-                _logger.LogWarning("Subscription {SubName} message store is not initialized.", sub.Name);
-                continue;
-            }
-
-            try
-            {
-                if (!string.IsNullOrWhiteSpace(matchedRule.ActionExpression))
-                {
-                    _logger.LogWarning(
-                        "Subscription rule {RuleName} on {TopicName}/{SubName} has an action expression, which is not implemented yet.",
-                        matchedRule.Name,
-                        _topic.Name,
-                        sub.Name);
-                }
-
-                long seqNum = sub.AssignNextSequenceNumber();
-                long enqueueTicks = DateTime.UtcNow.Ticks;
-
-                long ttlTicks = 0;
-                uint? msgTtlMs = message.Header?.Ttl;
-                if (msgTtlMs.HasValue && msgTtlMs.Value > 0)
-                    ttlTicks = TimeSpan.FromMilliseconds(msgTtlMs.Value).Ticks;
-                else if (sub.DefaultMessageTimeToLive != TimeSpan.MaxValue)
-                    ttlTicks = sub.DefaultMessageTimeToLive.Ticks;
-
-                var messageToStore = new Message
-                {
-                    Header = message.Header,
-                    Properties = message.Properties,
-                    ApplicationProperties = message.ApplicationProperties ?? new ApplicationProperties(),
-                    MessageAnnotations = message.MessageAnnotations ?? new MessageAnnotations(),
-                    BodySection = message.BodySection
-                };
-                messageToStore.MessageAnnotations[SequenceNumberAnnotation] = seqNum;
-                var enqueuedTimeUtc = new DateTime(enqueueTicks, DateTimeKind.Utc);
-                messageToStore.MessageAnnotations[EnqueuedTimeUtcAnnotation] = enqueuedTimeUtc;
-                messageToStore.MessageAnnotations[EnqueuedTimeAnnotation] = enqueuedTimeUtc;
-
-                if (sub.RequiresSession && string.IsNullOrEmpty(message.Properties?.GroupId))
-                {
-                    _logger.LogWarning("Message seq={SeqNum} is missing SessionId on session-enabled subscription {SubName} under topic {TopicName}, dead-lettering", seqNum, sub.Name, _topic.Name);
-                    var subDlqStore = sub.DlqMessageStore;
-                    if (subDlqStore != null)
-                    {
-                        messageToStore.ApplicationProperties["DeadLetterReason"] = "SessionIdIsNull";
-                        messageToStore.ApplicationProperties["DeadLetterErrorDescription"] = "The SessionId was not set on a message sent to a session-enabled entity.";
-
-                        var header = new MessageHeader
-                        {
-                            SequenceNumber = seqNum,
-                            EnqueueTimeUtcTicks = enqueueTicks,
-                            DeliveryCount = 0,
-                            IsDeadLettered = true,
-                            TimeToLiveTicks = ttlTicks
-                        };
-
-                        byte[] encoded = MessageSerializer.Encode(messageToStore, header);
-                        subDlqStore.Append(encoded);
-                        sub.IncrementDeadLetterMessageCount();
-                    }
-                    continue;
-                }
-
-                var headerNormal = new MessageHeader
-                {
-                    SequenceNumber = seqNum,
-                    EnqueueTimeUtcTicks = enqueueTicks,
-                    DeliveryCount = 0,
-                    IsDeadLettered = false,
-                    TimeToLiveTicks = ttlTicks
-                };
-
-                byte[] encodedNormal = MessageSerializer.Encode(messageToStore, headerNormal);
-                long address = subStore.Append(encodedNormal);
-                sub.IncrementMessageCount();
-
-                string? sessionId = message.Properties?.GroupId;
-                if (sub.RequiresSession && !string.IsNullOrEmpty(sessionId))
-                {
-                    var q = sub.SessionMessageAddresses.GetOrAdd(sessionId, _ => new ConcurrentQueue<long>());
-                    q.Enqueue(address);
-                }
-
-                _logger.LogDebug("Enqueued message seq={SeqNum} to subscription {SubName} under topic {TopicName} (session={SessionId})", seqNum, sub.Name, _topic.Name, sessionId);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to fan out message from topic {TopicName} to subscription {SubName}", _topic.Name, sub.Name);
-            }
-        }
-    }
-
-
 
     public override void OnFlow(FlowContext flowContext)
     {
@@ -702,7 +622,7 @@ public class EntityLinkEndpoint : LinkEndpoint
                     }
                     else
                     {
-                        AppendToStore(innerMsg, store);
+                        _entityManager.Route(_entity, innerMsg, new RouteOptions(ToDeadLetter: _isDlq));
                     }
                 }
                 catch (Exception ex)
@@ -720,65 +640,11 @@ public class EntityLinkEndpoint : LinkEndpoint
             }
             else
             {
-                AppendToStore(outerMessage, store);
+                _entityManager.Route(_entity, outerMessage, new RouteOptions(ToDeadLetter: _isDlq));
             }
         }
 
         messageContext.Complete();
-    }
-
-    private void AppendToStore(Message message, MessageStore store)
-    {
-        long seqNum = _entity.AssignNextSequenceNumber();
-        long enqueueTicks = DateTime.UtcNow.Ticks;
-
-        long ttlTicks = ComputeTtlTicks(message, _entity);
-
-        var messageToStore = new Message
-        {
-            Header = message.Header,
-            Properties = message.Properties,
-            ApplicationProperties = message.ApplicationProperties,
-            MessageAnnotations = message.MessageAnnotations ?? new MessageAnnotations(),
-            BodySection = message.BodySection
-        };
-        messageToStore.MessageAnnotations[SequenceNumberAnnotation] = seqNum;
-        var enqueuedTimeUtc = new DateTime(enqueueTicks, DateTimeKind.Utc);
-        messageToStore.MessageAnnotations[EnqueuedTimeUtcAnnotation] = enqueuedTimeUtc;
-        messageToStore.MessageAnnotations[EnqueuedTimeAnnotation] = enqueuedTimeUtc;
-
-        var header = new MessageHeader
-        {
-            SequenceNumber = seqNum,
-            EnqueueTimeUtcTicks = enqueueTicks,
-            DeliveryCount = 0,
-            IsDeadLettered = _isDlq,
-            TimeToLiveTicks = ttlTicks
-        };
-
-        byte[] encoded = MessageSerializer.Encode(messageToStore, header);
-        long address = store.Append(encoded);
-        if (_isDlq) _entity.IncrementDeadLetterMessageCount();
-        else _entity.IncrementMessageCount();
-
-        string? sessionId = message.Properties?.GroupId;
-        if (!_isDlq && _entity.RequiresSession && !string.IsNullOrEmpty(sessionId))
-        {
-            var q = _entity.SessionMessageAddresses.GetOrAdd(sessionId, _ => new ConcurrentQueue<long>());
-            q.Enqueue(address);
-        }
-
-        _logger.LogDebug("Enqueued message seq={SeqNum} to entity {EntityName} (isDlq={IsDlq}, session={SessionId})", seqNum, _entity.Name, _isDlq, sessionId);
-    }
-
-    private static long ComputeTtlTicks(Message message, IMessageEntity entity)
-    {
-        uint? msgTtlMs = message.Header?.Ttl;
-        if (msgTtlMs.HasValue && msgTtlMs.Value > 0)
-            return TimeSpan.FromMilliseconds(msgTtlMs.Value).Ticks;
-        if (entity.DefaultMessageTimeToLive != TimeSpan.MaxValue)
-            return entity.DefaultMessageTimeToLive.Ticks;
-        return 0;
     }
 
     public override void OnFlow(FlowContext flowContext)
@@ -811,7 +677,9 @@ public class EntityLinkEndpoint : LinkEndpoint
 
         try
         {
-            for (int i = 0; i < count; i++)
+            // Credit is used only by messages actually sent: one dead-lettered or discarded on the way (max delivery
+            // count, expiry) must not use it up, or the receiver waits for a message that is already available.
+            for (int sent = 0; sent < count;)
             {
                 if (link.IsClosed || _cts.IsCancellationRequested) break;
 
@@ -855,6 +723,7 @@ public class EntityLinkEndpoint : LinkEndpoint
 
                 message.MessageAnnotations[SequenceNumberAnnotation] = header.SequenceNumber;
                 message.Header ??= new Header();
+                dispatcher.ApplyModifiedProperties(logAddressValue, message);
                 
                 int overlayDeliveryCount = dispatcher.GetDeliveryCount(logAddressValue);
                 uint currentDeliveryCount = (uint)(header.DeliveryCount + overlayDeliveryCount);
@@ -877,9 +746,7 @@ public class EntityLinkEndpoint : LinkEndpoint
 
                     if (effectiveTtlTicks > 0 && DateTime.UtcNow.Ticks > header.EnqueueTimeUtcTicks + effectiveTtlTicks)
                     {
-                        _logger.LogInformation("Message seq={SeqNum} has expired (TTL) on entity {EntityName}, dead-lettering",
-                            header.SequenceNumber, _entity.Name);
-                        await _entityManager.DeadLetterMessageAsync(_entity, logAddressValue, "TTLExpiredException", "The message has expired.");
+                        await _entityManager.ExpireMessageAsync(_entity, logAddressValue, header.SequenceNumber);
                         continue;
                     }
                 }
@@ -907,16 +774,19 @@ public class EntityLinkEndpoint : LinkEndpoint
                 {
                     if (_receiveAndDelete)
                     {
-                        // In ReceiveAndDelete mode, the message is settled on the wire immediately.
-                        link.SendMessage(message);
+                        // In ReceiveAndDelete mode the message is settled when it is sent, so it leaves the entity
+                        // (completed, and no longer counted) before the client can see it: a client that reads the
+                        // count right after receiving must not find the message still counted.
                         dispatcher.Complete(logAddressValue, lockToken);
                         if (_isDlq) _entity.DecrementDeadLetterMessageCount();
                         else _entity.DecrementMessageCount();
+                        link.SendMessage(message);
                     }
                     else
                     {
                         SendMessageWithDeliveryTag(link, message, lockToken.ToByteArray());
                     }
+                    sent++;
                     _logger.LogDebug("Sent message seq={SeqNum} (ReceiveAndDelete={Rad}, isDlq={IsDlq})", header.SequenceNumber, _receiveAndDelete, _isDlq);
                 }
                 catch (Exception ex)
@@ -996,10 +866,11 @@ public class EntityLinkEndpoint : LinkEndpoint
         {
             bool undeliverableHere = false;
             if (state is Modified modified) undeliverableHere = modified.UndeliverableHere;
+            var propertiesToModify = PropertiesToModify.FromModified(state as Modified);
 
             if (undeliverableHere)
             {
-                if (dispatcher.Defer(lockState.LogAddress, lockToken, lockState.SequenceNumber))
+                if (dispatcher.Defer(lockState.LogAddress, lockToken, lockState.SequenceNumber, propertiesToModify))
                 {
                     _logger.LogDebug("Deferred message seq={SeqNum} on entity {EntityName}", lockState.SequenceNumber, _entity.Name);
                 }
@@ -1011,7 +882,7 @@ public class EntityLinkEndpoint : LinkEndpoint
             else
             {
                 dispatcher.IncrementDeliveryCount(lockState.LogAddress);
-                if (dispatcher.Abandon(lockState.LogAddress, lockToken))
+                if (dispatcher.Abandon(lockState.LogAddress, lockToken, propertiesToModify))
                 {
                     _logger.LogDebug("Abandoned message seq={SeqNum} on entity {EntityName}", lockState.SequenceNumber, _entity.Name);
                 }
@@ -1023,19 +894,12 @@ public class EntityLinkEndpoint : LinkEndpoint
         }
         else if (state is Rejected rejected)
         {
-            string? reason = rejected.Error?.Condition;
-            string? description = rejected.Error?.Description;
-
-            if (rejected.Error?.Info != null)
-            {
-                if (rejected.Error.Info.TryGetValue(new Symbol("DeadLetterReason"), out var r)) reason = r?.ToString();
-                if (rejected.Error.Info.TryGetValue(new Symbol("DeadLetterErrorDescription"), out var d)) description = d?.ToString();
-            }
+            var details = DeadLetterDetails.FromRejected(rejected);
 
             if (!_isDlq)
             {
                 // We must use synchronous wait here because OnDisposition is synchronous
-                _entityManager.DeadLetterMessageAsync(_entity, lockState.LogAddress, reason, description).GetAwaiter().GetResult();
+                _entityManager.DeadLetterMessageAsync(_entity, lockState.LogAddress, details).GetAwaiter().GetResult();
             }
             else
             {
@@ -1067,6 +931,7 @@ public class EntityLinkEndpoint : LinkEndpoint
     public override void OnLinkClosed(ListenerLink link, Error error)
     {
         _cts.Cancel();
+        _entity.Activity.ReceiverDetached(link);
         if (!_isDlq && !string.IsNullOrEmpty(_sessionId))
         {
             _entityManager.ReleaseSessionLock(_entityPath, _sessionId, link.Name);

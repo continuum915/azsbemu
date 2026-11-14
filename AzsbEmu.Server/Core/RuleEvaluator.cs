@@ -36,7 +36,7 @@ public static class RuleEvaluator
 
         try
         {
-            var filter = System.Text.Json.JsonSerializer.Deserialize<CorrelationFilterDto>(rule.FilterExpression);
+            var filter = CorrelationFilterDto.Parse(rule.FilterExpression);
             if (filter == null) return false;
 
             if (filter.CorrelationId != null && !MatchStringValue(filter.CorrelationId, message.Properties?.CorrelationId)) return false;

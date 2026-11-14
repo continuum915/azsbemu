@@ -1,0 +1,20 @@
+ dotnet run --project AzsbEmu.Benchmarks/AzsbEmu.Benchmarks.csproj --benchmark concurrent --entities 500 --messages 50000 --producers 16 --consumers 16 --message-size 1024
+
+Running concurrent load benchmark with 500 queues, 50000 messages, 16 producers, and 16 consumers.
+  Concurrent Send Results:
+    - Throughput: 1223.28 ops/sec
+    - Latency (Avg): 12.87 ms
+    - Latency (Min / Max): 0.03 ms / 7419.34 ms
+    - Latency (P50 / P95 / P99): 0.10 ms / 36.06 ms / 108.49 ms
+  Concurrent Receive & Complete Results:
+    - Throughput: 1180.56 ops/sec
+    - Latency (Avg): 416.27 ms
+    - Latency (Min / Max): 0.14 ms / 10219.13 ms
+    - Latency (P50 / P95 / P99): 114.23 ms / 1582.67 ms / 7611.89 ms
+  Validation:
+    - Unique messages received: 50000/50000
+    - Duplicate deliveries:      0
+  Resource usage:
+    - Working set delta: 119.73 MB
+    - Managed heap delta: -29.23 MB
+    - Data directory size: 56.73 MB

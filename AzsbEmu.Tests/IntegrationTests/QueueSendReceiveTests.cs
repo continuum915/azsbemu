@@ -575,7 +575,7 @@ public class QueueSendReceiveTests : IDisposable
     public async Task Queue_MessageWithTtl_ExpiresAndMovesToDlq()
     {
         const string ttlQueue = "ttl-test-queue";
-        _broker.EnsureQueue(ttlQueue);
+        _broker.EnsureQueue(ttlQueue, deadLetteringOnMessageExpiration: true);
         await using var client = new ServiceBusClient(_broker.ConnectionString);
         await using var sender = client.CreateSender(ttlQueue);
         await using var receiver = client.CreateReceiver(ttlQueue);
@@ -616,7 +616,7 @@ public class QueueSendReceiveTests : IDisposable
     public async Task Queue_MessageWithTtl_AtDeliveryTime_IsDeadLettered()
     {
         const string ttlQueue2 = "ttl-delivery-test-queue";
-        _broker.EnsureQueue(ttlQueue2);
+        _broker.EnsureQueue(ttlQueue2, deadLetteringOnMessageExpiration: true);
         await using var client = new ServiceBusClient(_broker.ConnectionString);
         await using var sender = client.CreateSender(ttlQueue2);
         await using var receiver = client.CreateReceiver(ttlQueue2);

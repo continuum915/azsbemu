@@ -2,4 +2,9 @@
   <Project Path="AzsbEmu.Server/AzsbEmu.Server.csproj" />
   <Project Path="AzsbEmu.Tests/AzsbEmu.Tests.csproj" />
   <Project Path="AzsbEmu.Benchmarks/AzsbEmu.Benchmarks.csproj" />
+  <Folder Name="/Interop/">
+    <Project Path="Interop/AzsbEmu.Interop.Contracts/AzsbEmu.Interop.Contracts.csproj" />
+    <Project Path="Interop/AzsbEmu.Interop.Mt7Tests/AzsbEmu.Interop.Mt7Tests.csproj" />
+    <Project Path="Interop/AzsbEmu.Interop.Mt8Peer/AzsbEmu.Interop.Mt8Peer.csproj" />
+  </Folder>
 </Solution>

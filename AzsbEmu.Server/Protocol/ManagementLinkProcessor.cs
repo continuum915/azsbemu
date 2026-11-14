@@ -113,6 +113,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         var operation = message.ApplicationProperties?["operation"] as string;
 
         _logger.LogDebug("Management: operation {Operation} for {EntityPath}", operation, _entityPath);
+        // Operations on the entity count as activity for AutoDeleteOnIdle; reading its runtime info does not.
+        if (operation != "com.microsoft:get-runtime-info") _entityManager.RecordActivity(_entityPath);
 
         Message response;
         switch (operation)
@@ -193,6 +195,13 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
             response.Properties ??= new Properties();
             response.Properties.CorrelationId = message.Properties.MessageId;
         }
+
+        // The SDK reads "statusCode"; older clients and some handlers use "status-code". Always send both.
+        var appProps = response.ApplicationProperties ??= new ApplicationProperties();
+        if (appProps.Map.ContainsKey("status-code") && !appProps.Map.ContainsKey("statusCode"))
+            appProps["statusCode"] = appProps["status-code"];
+        if (appProps.Map.ContainsKey("status-description") && !appProps.Map.ContainsKey("statusDescription"))
+            appProps["statusDescription"] = appProps["status-description"];
 
         var replyTo = message.Properties?.ReplyTo;
         if (string.IsNullOrWhiteSpace(replyTo) || !_replyToLinks.TryGet(replyTo, out var responseLink))
@@ -292,23 +301,23 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         try
         {
             var rule = ParseRuleDescription(request.Body);
+            rule.NormalizeFilter(); // the SDK sends TrueRuleFilter/FalseRuleFilter as sql-filter "1=1" / "1=0"
             if (string.Equals(rule.FilterType, "Sql", StringComparison.OrdinalIgnoreCase))
             {
                 SqlFilterEvaluator.Validate(rule.FilterExpression);
             }
+            SqlFilterEvaluator.ValidateAction(rule.ActionExpression);
 
-            bool success = _entityManager.SaveRule(topicName, subName, rule);
-            if (success)
+            var outcome = _entityManager.CreateRule(topicName, subName, rule);
+            var response = new Message { ApplicationProperties = new ApplicationProperties() };
+            response.ApplicationProperties["status-code"] = outcome switch
             {
-                var response = new Message { ApplicationProperties = new ApplicationProperties() };
-                response.ApplicationProperties["status-code"] = 200;
-                return response;
-            }
-
-            var failedResponse = new Message { ApplicationProperties = new ApplicationProperties() };
-            failedResponse.ApplicationProperties["status-code"] = 500;
-            failedResponse.ApplicationProperties["status-description"] = "Failed to persist rule in database.";
-            return failedResponse;
+                { Found: false } => 404,
+                { Error: not null } => 409,
+                _ => 200,
+            };
+            if (outcome.Error is { } error) response.ApplicationProperties["status-description"] = error;
+            return response;
         }
         catch (Exception ex)
         {
@@ -341,7 +350,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         }
         else if (request.Body is Map mapBody)
         {
-            ruleName = mapBody["ruleName"] as string;
+            ruleName = MapValue(mapBody, "rule-name") as string ?? MapValue(mapBody, "ruleName") as string;
         }
         else if (request.ApplicationProperties?.Map.ContainsKey("ruleName") == true)
         {
@@ -426,12 +435,13 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
             if (request.ApplicationProperties.Map.ContainsKey("top") && request.ApplicationProperties["top"] is int t) top = t;
         }
 
+        // Each entry is a map holding the described rule-description, as the Service Bus protocol documents.
         var rulesList = new List();
         lock (sub.Rules)
         {
             foreach (var rule in sub.Rules.Skip(skip).Take(top))
             {
-                rulesList.Add(EncodeRuleDescription(rule));
+                rulesList.Add(new Map { ["rule-description"] = EncodeRuleDescription(rule) });
             }
         }
 
@@ -439,7 +449,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         responseMap["rules"] = rulesList;
 
         var response = new Message(responseMap) { ApplicationProperties = new ApplicationProperties() };
-        response.ApplicationProperties["status-code"] = 200;
+        response.ApplicationProperties["status-code"] = rulesList.Count > 0 ? 200 : 204;
         return response;
     }
 
@@ -448,7 +458,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         if (bodyVal is DescribedValue describedRule)
         {
             var desc = describedRule.Descriptor;
-            if (IsDescriptor(desc, "com.microsoft:rule-description", 0x0000013700000004UL))
+            if (IsDescriptor(desc, "com.microsoft:rule-description", RuleDescriptionCode))
             {
                 if (describedRule.Value is List ruleList && ruleList.Count >= 3)
                 {
@@ -459,32 +469,111 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                     var rule = new RuleInfo
                     {
                         Name = ruleName,
-                        ActionExpression = actionObj?.ToString() ?? string.Empty
+                        ActionExpression = ReadRuleAction(actionObj)
                     };
                     PopulateFilter(rule, filterObj);
                     return rule;
                 }
             }
         }
-        else if (bodyVal is Map ruleMap)
+        else if (bodyVal is Map ruleMap && MapValue(ruleMap, "rule-description") is Map description)
         {
-            var ruleName = ruleMap["RuleName"] as string ?? "$Default";
-            var rule = new RuleInfo { Name = ruleName };
-            if (ruleMap["Filter"] != null)
+            // The Service Bus SDK's shape: { rule-name, rule-description: { sql-filter | correlation-filter | true-filter
+            // | false-filter: {...}, sql-rule-action: { expression } | null, rule-name } }.
+            var rule = new RuleInfo
             {
-                PopulateFilter(rule, ruleMap["Filter"]);
+                Name = MapValue(ruleMap, "rule-name") as string ?? MapValue(description, "rule-name") as string ?? "$Default",
+            };
+            ReadRuleDescriptionMap(rule, description);
+            return rule;
+        }
+        else if (bodyVal is Map legacyMap)
+        {
+            var rule = new RuleInfo { Name = MapValue(legacyMap, "RuleName") as string ?? "$Default" };
+            if (MapValue(legacyMap, "Filter") is { } filter)
+            {
+                PopulateFilter(rule, filter);
             }
 
-            if (ruleMap.ContainsKey("Action") && ruleMap["Action"] != null)
-            {
-                rule.ActionExpression = ruleMap["Action"]!.ToString() ?? string.Empty;
-            }
-
+            rule.ActionExpression = ReadRuleAction(MapValue(legacyMap, "Action"));
             return rule;
         }
 
         throw new ArgumentException("Unsupported rule-description format in message body");
     }
+
+    /// <summary>A map entry by name, whether the key was sent as a string or an AMQP symbol; null if absent.</summary>
+    private static object? MapValue(Map map, string key)
+    {
+        if (map.TryGetValue(key, out var value)) return value;
+        if (map.TryGetValue(new Symbol(key), out value)) return value;
+        return null;
+    }
+
+    private static bool MapHasKey(Map map, string key) => map.ContainsKey(key) || map.ContainsKey(new Symbol(key));
+
+    private static void ReadRuleDescriptionMap(RuleInfo rule, Map description)
+    {
+        if (MapValue(description, "sql-filter") is Map sql)
+        {
+            rule.FilterType = "Sql";
+            rule.FilterExpression = MapValue(sql, "expression") as string ?? "";
+        }
+        else if (MapValue(description, "correlation-filter") is Map corr)
+        {
+            var dto = new CorrelationFilterDto
+            {
+                CorrelationId = MapValue(corr, "correlation-id") as string,
+                MessageId = MapValue(corr, "message-id") as string,
+                To = MapValue(corr, "to") as string,
+                ReplyTo = MapValue(corr, "reply-to") as string,
+                Label = MapValue(corr, "label") as string,
+                SessionId = MapValue(corr, "session-id") as string,
+                ReplyToSessionId = MapValue(corr, "reply-to-session-id") as string,
+                ContentType = MapValue(corr, "content-type") as string,
+            };
+            if (MapValue(corr, "properties") is Map properties && properties.Count > 0)
+            {
+                dto.Properties = new Dictionary<string, object>();
+                foreach (var key in properties.Keys)
+                {
+                    if (properties[key] is { } value) dto.SetProperty(key.ToString()!, value);
+                }
+            }
+            rule.FilterType = "Correlation";
+            rule.FilterExpression = System.Text.Json.JsonSerializer.Serialize(dto);
+        }
+        else if (MapHasKey(description, "false-filter"))
+        {
+            rule.FilterType = "False";
+        }
+        else if (MapHasKey(description, "true-filter"))
+        {
+            rule.FilterType = "True";
+        }
+        else
+        {
+            throw new ArgumentException("The rule description has no supported filter (sql-filter, correlation-filter, true-filter, false-filter).");
+        }
+
+        rule.ActionExpression = MapValue(description, "sql-rule-action") is Map action
+            ? MapValue(action, "expression") as string ?? string.Empty
+            : string.Empty;
+    }
+
+    /// <summary>
+    /// The SQL text of a rule action: a plain string, a described <c>sql-rule-action</c> (its first field), or empty
+    /// for no action / a described <c>empty-rule-action</c>.
+    /// </summary>
+    private static string ReadRuleAction(object? action) => action switch
+    {
+        null => string.Empty,
+        string sql => sql,
+        DescribedValue { Value: List fields } d when IsDescriptor(d.Descriptor, "com.microsoft:sql-rule-action", SqlRuleActionCode)
+            => fields.Count > 0 ? fields[0] as string ?? string.Empty : string.Empty,
+        DescribedValue d when IsDescriptor(d.Descriptor, "com.microsoft:empty-rule-action", EmptyRuleActionCode) => string.Empty,
+        _ => throw new ArgumentException($"Unsupported rule action '{action}'."),
+    };
 
     private static bool IsDescriptor(object descriptor, string symbol, ulong code)
     {
@@ -506,15 +595,15 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         if (filterObj is DescribedValue describedFilter)
         {
             var desc = describedFilter.Descriptor;
-            if (IsDescriptor(desc, "com.microsoft:true-filter", 0x0000013700000007UL))
+            if (IsDescriptor(desc, "com.microsoft:true-filter", TrueFilterCode))
             {
                 rule.FilterType = "True";
             }
-            else if (IsDescriptor(desc, "com.microsoft:false-filter", 0x0000013700000008UL))
+            else if (IsDescriptor(desc, "com.microsoft:false-filter", FalseFilterCode))
             {
                 rule.FilterType = "False";
             }
-            else if (IsDescriptor(desc, "com.microsoft:sql-filter", 0x0000013700000006UL))
+            else if (IsDescriptor(desc, "com.microsoft:sql-filter", SqlFilterCode))
             {
                 rule.FilterType = "Sql";
                 if (describedFilter.Value is List sqlList && sqlList.Count > 0)
@@ -522,7 +611,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                     rule.FilterExpression = sqlList[0] as string ?? "";
                 }
             }
-            else if (IsDescriptor(desc, "com.microsoft:correlation-filter", 0x0000013700000009UL))
+            else if (IsDescriptor(desc, "com.microsoft:correlation-filter", CorrelationFilterCode))
             {
                 rule.FilterType = "Correlation";
                 if (describedFilter.Value is List corrList)
@@ -543,7 +632,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                         {
                             if (key is string sKey && mapProps[key] != null)
                             {
-                                dto.Properties[sKey] = mapProps[key];
+                                dto.SetProperty(sKey, mapProps[key]!);
                             }
                         }
                     }
@@ -578,7 +667,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                     {
                         if (key is string sKey && mapProps[key] != null)
                         {
-                            dto.Properties[sKey] = mapProps[key];
+                            dto.SetProperty(sKey, mapProps[key]!);
                         }
                     }
                 }
@@ -588,79 +677,45 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         }
     }
 
+    // Numeric descriptor codes from the Service Bus AMQP protocol: the SDK decodes described values into its rule
+    // types by code, so symbolic descriptors would reach it as untyped values. Note the filter codes are one hex
+    // digit shorter than the rule-description and action codes (sql-filter 0x1370000006 vs sql-rule-action 0x13700000006).
+    private const ulong RuleDescriptionCode = 0x0000013700000004UL;
+    private const ulong EmptyRuleActionCode = 0x0000013700000005UL;
+    private const ulong SqlRuleActionCode = 0x0000013700000006UL;
+    private const ulong SqlFilterCode = 0x000001370000006UL;
+    private const ulong TrueFilterCode = 0x000001370000007UL;
+    private const ulong FalseFilterCode = 0x000001370000008UL;
+    private const ulong CorrelationFilterCode = 0x000001370000009UL;
+
     private DescribedValue EncodeRuleDescription(RuleInfo rule)
     {
-        DescribedValue filterVal;
-        if (string.Equals(rule.FilterType, "True", StringComparison.OrdinalIgnoreCase))
+        DescribedValue filter = rule.FilterType.ToLowerInvariant() switch
         {
-            filterVal = new DescribedValue(new Symbol("com.microsoft:true-filter"), new List());
-        }
-        else if (string.Equals(rule.FilterType, "False", StringComparison.OrdinalIgnoreCase))
-        {
-            filterVal = new DescribedValue(new Symbol("com.microsoft:false-filter"), new List());
-        }
-        else if (string.Equals(rule.FilterType, "Sql", StringComparison.OrdinalIgnoreCase))
-        {
-            var sqlList = new List { rule.FilterExpression ?? "", 20 };
-            filterVal = new DescribedValue(new Symbol("com.microsoft:sql-filter"), sqlList);
-        }
-        else if (string.Equals(rule.FilterType, "Correlation", StringComparison.OrdinalIgnoreCase))
-        {
-            var corrList = new List();
-            try
-            {
-                var dto = System.Text.Json.JsonSerializer.Deserialize<CorrelationFilterDto>(rule.FilterExpression);
-                if (dto != null)
-                {
-                    corrList.Add(dto.CorrelationId);
-                    corrList.Add(dto.MessageId);
-                    corrList.Add(dto.To);
-                    corrList.Add(dto.ReplyTo);
-                    corrList.Add(dto.Label);
-                    corrList.Add(dto.SessionId);
-                    corrList.Add(dto.ReplyToSessionId);
-                    corrList.Add(dto.ContentType);
-
-                    var mapProps = new Map();
-                    if (dto.Properties != null)
-                    {
-                        foreach (var kvp in dto.Properties)
-                        {
-                            mapProps[kvp.Key] = NormalizeFilterValue(kvp.Value);
-                        }
-                    }
-
-                    corrList.Add(mapProps);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to deserialize CorrelationFilterDto for rule {RuleName}", rule.Name);
-                while (corrList.Count < 8)
-                {
-                    corrList.Add(null);
-                }
-
-                corrList.Add(new Map());
-            }
-
-            filterVal = new DescribedValue(new Symbol("com.microsoft:correlation-filter"), corrList);
-        }
-        else
-        {
-            filterVal = new DescribedValue(new Symbol("com.microsoft:true-filter"), new List());
-        }
-
-        object? actionVal = string.IsNullOrWhiteSpace(rule.ActionExpression) ? null : rule.ActionExpression;
-
-        var ruleList = new List
-        {
-            filterVal,
-            actionVal,
-            rule.Name
+            "sql" => new DescribedValue(SqlFilterCode, new List { rule.FilterExpression ?? "", 20 }),
+            "false" => new DescribedValue(FalseFilterCode, new List { "1=0", 20 }),
+            "correlation" => new DescribedValue(CorrelationFilterCode, EncodeCorrelationFilter(rule)),
+            _ => new DescribedValue(TrueFilterCode, new List { "1=1", 20 }),
         };
 
-        return new DescribedValue(new Symbol("com.microsoft:rule-description"), ruleList);
+        var action = string.IsNullOrWhiteSpace(rule.ActionExpression)
+            ? new DescribedValue(EmptyRuleActionCode, new List())
+            : new DescribedValue(SqlRuleActionCode, new List { rule.ActionExpression, 20 });
+
+        return new DescribedValue(RuleDescriptionCode, new List { filter, action, rule.Name, DateTime.UtcNow });
+    }
+
+    private List EncodeCorrelationFilter(RuleInfo rule)
+    {
+        var dto = CorrelationFilterDto.Parse(rule.FilterExpression);
+
+        var properties = new Map();
+        foreach (var kvp in dto.TypedProperties())
+        {
+            properties[kvp.Key] = NormalizeFilterValue(kvp.Value);
+        }
+
+        return new List { dto.CorrelationId, dto.MessageId, dto.To, dto.ReplyTo, dto.Label, dto.SessionId, dto.ReplyToSessionId, dto.ContentType, properties };
     }
 
     private static object? NormalizeFilterValue(object? value)
@@ -729,7 +784,9 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
 
             decoded.MessageAnnotations ??= new MessageAnnotations();
             decoded.Header ??= new Header();
-            decoded.Header.DeliveryCount = (uint)header.DeliveryCount;
+            // Include the in-memory increments from abandons and lock expiries (ADR 0001), as link delivery and peek do.
+            decoded.Header.DeliveryCount = (uint)(header.DeliveryCount + dispatcher.GetDeliveryCount(logAddress));
+            dispatcher.ApplyModifiedProperties(logAddress, decoded);
             decoded.MessageAnnotations[SequenceNumberAnnotation] = header.SequenceNumber;
             decoded.MessageAnnotations[EnqueuedTimeUtcAnnotation] = new DateTime(header.EnqueueTimeUtcTicks, DateTimeKind.Utc);
             decoded.MessageAnnotations[EnqueuedTimeAnnotation] = new DateTime(header.EnqueueTimeUtcTicks, DateTimeKind.Utc);
@@ -919,6 +976,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
 
         string? dlReason = mapBody.ContainsKey("deadletter-reason") ? mapBody["deadletter-reason"] as string : null;
         string? dlDescription = mapBody.ContainsKey("deadletter-description") ? mapBody["deadletter-description"] as string : null;
+        var propertiesToModify = PropertiesToModify.FromMap(MapValue(mapBody, "properties-to-modify") as Map);
+        var deadLetter = new DeadLetterDetails(dlReason, dlDescription, propertiesToModify);
 
         var deliveryState = request.GetDelivery().State;
         if (deliveryState is TransactionalState txnState)
@@ -934,7 +993,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                         continue;
                     }
 
-                    _entityManager.BufferSettlement(txnId, lockToken, dispositionStatus, dlReason, dlDescription);
+                    _entityManager.BufferSettlement(txnId, lockToken, dispositionStatus, deadLetter);
                 }
                 return CreateManagementResponse(200, null);
             }
@@ -1002,13 +1061,13 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                     break;
                 case "abandoned":
                     dispatcher.IncrementDeliveryCount(lockState.LogAddress);
-                    dispatcher.Abandon(lockState.LogAddress, lockToken);
+                    dispatcher.Abandon(lockState.LogAddress, lockToken, propertiesToModify);
                     break;
                 case "suspended":
-                    _entityManager.DeadLetterMessageAsync(entity, lockState.LogAddress, dlReason, dlDescription).GetAwaiter().GetResult();
+                    _entityManager.DeadLetterMessageAsync(entity, lockState.LogAddress, deadLetter).GetAwaiter().GetResult();
                     break;
                 case "defered":
-                    dispatcher.Defer(lockState.LogAddress, lockToken, lockState.SequenceNumber);
+                    dispatcher.Defer(lockState.LogAddress, lockToken, lockState.SequenceNumber, propertiesToModify);
                     break;
             }
         }
@@ -1299,6 +1358,7 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
 
         message.Header ??= new Header();
         message.Header.DeliveryCount = (uint)(header.DeliveryCount + (dispatcher?.GetDeliveryCount(address) ?? 0));
+        dispatcher?.ApplyModifiedProperties(address, message);
 
         var buffer = message.Encode();
         return buffer.Buffer.AsSpan(buffer.Offset, buffer.Length).ToArray();
@@ -1334,6 +1394,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         TimeSpan defaultTtl = GetPropertyValue<TimeSpan>(request, "default-message-time-to-live", "DefaultMessageTimeToLive");
         if (defaultTtl == default) defaultTtl = TimeSpan.MaxValue;
 
+        bool deadLetterOnExpiration = GetPropertyValue<bool>(request, "dead-lettering-on-message-expiration", "DeadLetteringOnMessageExpiration");
+
         var queue = new QueueInfo
         {
             Name = name,
@@ -1341,7 +1403,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
             LockDuration = lockDuration,
             MaxSizeInMegabytes = maxSizeInMegabytes,
             MaxDeliveryCount = maxDeliveryCount,
-            DefaultMessageTimeToLive = defaultTtl
+            DefaultMessageTimeToLive = defaultTtl,
+            DeadLetteringOnMessageExpiration = deadLetterOnExpiration,
         };
 
         if (_entityManager.CreateQueue(queue))
@@ -1353,7 +1416,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                 ["lock-duration"] = (long)lockDuration.TotalSeconds,
                 ["max-size-in-megabytes"] = maxSizeInMegabytes,
                 ["max-delivery-count"] = maxDeliveryCount,
-                ["default-message-time-to-live"] = defaultTtl == TimeSpan.MaxValue ? -1L : (long)defaultTtl.TotalSeconds
+                ["default-message-time-to-live"] = defaultTtl == TimeSpan.MaxValue ? -1L : (long)defaultTtl.TotalSeconds,
+                ["dead-lettering-on-message-expiration"] = deadLetterOnExpiration,
             };
             return CreateManagementResponse(201, responseMap);
         }
@@ -1423,6 +1487,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
         TimeSpan defaultTtl = GetPropertyValue<TimeSpan>(request, "default-message-time-to-live", "DefaultMessageTimeToLive");
         if (defaultTtl == default) defaultTtl = TimeSpan.MaxValue;
 
+        bool deadLetterOnExpiration = GetPropertyValue<bool>(request, "dead-lettering-on-message-expiration", "DeadLetteringOnMessageExpiration");
+
         var sub = new SubscriptionInfo
         {
             Name = subName,
@@ -1430,7 +1496,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
             RequiresSession = requiresSession,
             LockDuration = lockDuration,
             MaxDeliveryCount = maxDeliveryCount,
-            DefaultMessageTimeToLive = defaultTtl
+            DefaultMessageTimeToLive = defaultTtl,
+            DeadLetteringOnMessageExpiration = deadLetterOnExpiration,
         };
 
         if (_entityManager.CreateSubscription(topicName, sub))
@@ -1442,7 +1509,8 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
                 ["requires-session"] = requiresSession,
                 ["lock-duration"] = (long)lockDuration.TotalSeconds,
                 ["max-delivery-count"] = maxDeliveryCount,
-                ["default-message-time-to-live"] = defaultTtl == TimeSpan.MaxValue ? -1L : (long)defaultTtl.TotalSeconds
+                ["default-message-time-to-live"] = defaultTtl == TimeSpan.MaxValue ? -1L : (long)defaultTtl.TotalSeconds,
+                ["dead-lettering-on-message-expiration"] = deadLetterOnExpiration,
             };
             return CreateManagementResponse(201, responseMap);
         }
@@ -1807,14 +1875,14 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
             }
         }
 
-        bool renewed = _entityManager.RenewSessionLock(_entityPath, sessionId, "accept-session", lockDuration);
-        if (!renewed)
+        var lockedUntil = _entityManager.RenewSessionLock(_entityPath, sessionId, lockDuration);
+        if (lockedUntil == null)
         {
             return CreateManagementResponse(400, null, $"Failed to renew lock for session '{sessionId}'. The lock may have expired or is not held by this caller.");
         }
 
         var body = new Map();
-        body["expiration"] = DateTime.UtcNow + lockDuration;
+        body["expiration"] = lockedUntil.Value;
         return CreateManagementResponse(200, body);
     }
 

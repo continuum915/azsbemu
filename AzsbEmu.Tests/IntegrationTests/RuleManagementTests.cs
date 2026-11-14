@@ -51,13 +51,13 @@ public class RuleManagementTests : IDisposable
         var rulesList1 = Assert.IsType<List>(bodyMap1["rules"]);
         Assert.Single(rulesList1); // Only $Default
 
-        var ruleDesc1 = Assert.IsType<DescribedValue>(rulesList1[0]);
-        Assert.Equal("com.microsoft:rule-description", (ruleDesc1.Descriptor as Symbol)?.ToString());
+        var ruleDesc1 = RuleDescription(rulesList1[0]);
+        Assert.Equal(0x0000013700000004UL, ruleDesc1.Descriptor);
         var ruleListValues1 = Assert.IsType<List>(ruleDesc1.Value);
         Assert.Equal("$Default", ruleListValues1[2]); // RuleName is index 2
 
         var filterDesc1 = Assert.IsType<DescribedValue>(ruleListValues1[0]);
-        Assert.Equal("com.microsoft:true-filter", (filterDesc1.Descriptor as Symbol)?.ToString());
+        Assert.Equal(0x000001370000007UL, filterDesc1.Descriptor);
 
         // 2. Add a CorrelationFilter rule
         var corrFilterList = new List();
@@ -106,7 +106,7 @@ public class RuleManagementTests : IDisposable
         var rulesList2 = Assert.IsType<List>(bodyMap2["rules"]);
         Assert.Equal(2, rulesList2.Count);
 
-        var customRuleDesc = rulesList2.Cast<DescribedValue>().FirstOrDefault(r => 
+        var customRuleDesc = rulesList2.Select(RuleDescription).FirstOrDefault(r => 
         {
             var l = r.Value as List;
             return l != null && string.Equals(l[2] as string, "MyCustomRule");
@@ -114,7 +114,7 @@ public class RuleManagementTests : IDisposable
         Assert.NotNull(customRuleDesc);
         var customRuleValues = Assert.IsType<List>(customRuleDesc.Value);
         var customFilter = Assert.IsType<DescribedValue>(customRuleValues[0]);
-        Assert.Equal("com.microsoft:correlation-filter", (customFilter.Descriptor as Symbol)?.ToString());
+        Assert.Equal(0x000001370000009UL, customFilter.Descriptor);
         
         var customFilterValues = Assert.IsType<List>(customFilter.Value);
         Assert.Equal("corr-id-123", customFilterValues[0]);
@@ -146,7 +146,7 @@ public class RuleManagementTests : IDisposable
         var bodyMap3 = Assert.IsType<Map>(resp3.Body);
         var rulesList3 = Assert.IsType<List>(bodyMap3["rules"]);
         Assert.Single(rulesList3);
-        var finalRuleList = Assert.IsType<List>((rulesList3[0] as DescribedValue)?.Value);
+        var finalRuleList = Assert.IsType<List>(RuleDescription(rulesList3[0]).Value);
         Assert.Equal("MyCustomRule", finalRuleList[2]);
 
         await session.CloseAsync();
@@ -265,7 +265,7 @@ public class RuleManagementTests : IDisposable
 
         var bodyMap = Assert.IsType<Map>(enumResp.Body);
         var rules = Assert.IsType<List>(bodyMap["rules"]);
-        var sqlRuleDesc = rules.Cast<DescribedValue>().FirstOrDefault(r =>
+        var sqlRuleDesc = rules.Select(RuleDescription).FirstOrDefault(r =>
         {
             var ruleList = r.Value as List;
             return string.Equals(ruleList?[2] as string, "SqlBlueRule", StringComparison.Ordinal);
@@ -274,7 +274,7 @@ public class RuleManagementTests : IDisposable
         Assert.NotNull(sqlRuleDesc);
         var sqlRuleValues = Assert.IsType<List>(sqlRuleDesc!.Value);
         var sqlRuleFilter = Assert.IsType<DescribedValue>(sqlRuleValues[0]);
-        Assert.Equal("com.microsoft:sql-filter", (sqlRuleFilter.Descriptor as Symbol)?.ToString());
+        Assert.Equal(0x000001370000006UL, sqlRuleFilter.Descriptor);
         var sqlFilterValues = Assert.IsType<List>(sqlRuleFilter.Value);
         Assert.Equal("sys.Label = 'sql-subject' AND Color = 'Blue' AND Price >= 10", sqlFilterValues[0]);
 
@@ -385,6 +385,90 @@ public class RuleManagementTests : IDisposable
             }
         };
     }
+
+    [Fact]
+    public async Task AddRule_WithEmptyOrSqlRuleActions_AppliesOnlyTheSqlAction()
+    {
+        var connection = await OpenConnectionAsync();
+        var session = new Session(connection);
+        string mgmtPath = $"{TopicName}/subscriptions/{SubName}";
+        await RemoveRuleAsync(session, mgmtPath, "$Default");
+
+        // Three rules matching different messages: no action, a described empty action, and a SQL action.
+        await AddSqlRuleAsync(session, mgmtPath, "plain", "kind = 'plain'", action: null);
+        await AddSqlRuleAsync(session, mgmtPath, "empty-action", "kind = 'empty'",
+            action: new DescribedValue(new Symbol("com.microsoft:empty-rule-action"), new List()));
+        await AddSqlRuleAsync(session, mgmtPath, "sql-action", "kind = 'sql'",
+            action: new DescribedValue(new Symbol("com.microsoft:sql-rule-action"), new List { "SET tagged = 'yes'", 20 }));
+        await connection.CloseAsync();
+
+        await using var client = _broker.CreateServiceBusClient();
+        await using (var sender = client.CreateSender(TopicName))
+        {
+            foreach (var kind in new[] { "plain", "empty", "sql" })
+                await sender.SendMessageAsync(new Azure.Messaging.ServiceBus.ServiceBusMessage(kind) { ApplicationProperties = { ["kind"] = kind } });
+        }
+
+        await using var receiver = client.CreateReceiver(TopicName, SubName);
+        var received = new Dictionary<string, Azure.Messaging.ServiceBus.ServiceBusReceivedMessage>();
+        while (received.Count < 3 && await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5)) is { } msg)
+            received[msg.Body.ToString()] = msg;
+
+        Assert.Equal(new[] { "empty", "plain", "sql" }, received.Keys.Order());
+        Assert.False(received["plain"].ApplicationProperties.ContainsKey("tagged"));
+        Assert.False(received["empty"].ApplicationProperties.ContainsKey("tagged"));
+        Assert.Equal("yes", received["sql"].ApplicationProperties["tagged"]);
+    }
+
+    [Fact]
+    public async Task AddRule_WithAnInvalidSqlAction_IsRejected()
+    {
+        var connection = await OpenConnectionAsync();
+        var session = new Session(connection);
+        string mgmtPath = $"{TopicName}/subscriptions/{SubName}";
+
+        var response = await SendManagementRequestAsync(session, mgmtPath, AddRuleRequest("bad", "1=1",
+            new DescribedValue(new Symbol("com.microsoft:sql-rule-action"), new List { "UPDATE everything", 20 })));
+        await connection.CloseAsync();
+
+        Assert.Equal(400, response.ApplicationProperties?["status-code"]);
+    }
+
+    private async Task<Connection> OpenConnectionAsync()
+    {
+        var factory = new ConnectionFactory();
+        factory.SASL.Profile = new ClientMssbcbsSaslProfile();
+        return await factory.CreateAsync(new Address($"amqp://localhost:{_broker.Port}"));
+    }
+
+    private async Task AddSqlRuleAsync(Session session, string mgmtPath, string name, string filter, object? action)
+    {
+        var response = await SendManagementRequestAsync(session, mgmtPath, AddRuleRequest(name, filter, action));
+        Assert.Equal(200, response.ApplicationProperties?["status-code"]);
+    }
+
+    private static Message AddRuleRequest(string name, string filter, object? action)
+    {
+        var sqlFilter = new DescribedValue(new Symbol("com.microsoft:sql-filter"), new List { filter, 20 });
+        var request = new Message(new DescribedValue(new Symbol("com.microsoft:rule-description"), new List { sqlFilter, action, name }))
+        {
+            ApplicationProperties = new ApplicationProperties()
+        };
+        request.ApplicationProperties["operation"] = "com.microsoft:add-rule";
+        return request;
+    }
+
+    private async Task RemoveRuleAsync(Session session, string mgmtPath, string name)
+    {
+        var request = new Message(name) { ApplicationProperties = new ApplicationProperties() };
+        request.ApplicationProperties["operation"] = "com.microsoft:remove-rule";
+        var response = await SendManagementRequestAsync(session, mgmtPath, request);
+        Assert.Equal(200, response.ApplicationProperties?["status-code"]);
+    }
+
+    /// <summary>An enumerate-rules entry: a map holding the described rule-description (numeric descriptor codes).</summary>
+    private static DescribedValue RuleDescription(object? entry) =>
+        Assert.IsType<DescribedValue>(Assert.IsType<Map>(entry)["rule-description"]);
 
     private async Task<Message> SendManagementRequestAsync(Session session, string path, Message request)
     {

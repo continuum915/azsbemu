@@ -56,6 +56,80 @@ public class StartupRecoveryTests
         }
     }
 
+    /// <summary>
+    /// Regression: the active and dead-letter logs of an entity used to share one FASTER commit folder, so the
+    /// dead-letter log's commits could replace the active log's and a clean restart lost messages (intermittently,
+    /// hence several cycles with commit ticks in between).
+    /// </summary>
+    [Fact]
+    public async Task Restart_Repeatedly_NeverLosesPendingMessages()
+    {
+        int lost = 0;
+        for (int cycle = 1; cycle <= 10; cycle++)
+        {
+            string dataDir;
+            using (var broker = new BrokerFixture())
+            {
+                dataDir = broker.TakeDataDir();
+                broker.EnsureQueue("restart-queue");
+                await using var client = broker.CreateServiceBusClient();
+                await using var sender = client.CreateSender("restart-queue");
+                await sender.SendMessageAsync(new ServiceBusMessage($"cycle-{cycle}"));
+                await Task.Delay(200); // let periodic commits run before shutdown
+            }
+
+            try
+            {
+                using var restarted = new BrokerFixture(dataDir);
+                if (restarted.GetQueue("restart-queue").MessageCount != 1) lost++;
+            }
+            finally
+            {
+                try { Directory.Delete(dataDir, recursive: true); } catch { }
+            }
+        }
+
+        Assert.Equal(0, lost);
+    }
+
+    [Fact]
+    public async Task Restart_ActiveAndDeadLetterMessages_BothRecover()
+    {
+        const string queueName = "active-and-dlq-queue";
+        string dataDir;
+        using (var broker = new BrokerFixture())
+        {
+            dataDir = broker.TakeDataDir();
+            broker.EnsureQueue(queueName);
+            await using var client = broker.CreateServiceBusClient();
+            await using (var sender = client.CreateSender(queueName))
+            {
+                foreach (var body in new[] { "keep-1", "keep-2", "keep-3" })
+                    await sender.SendMessageAsync(new ServiceBusMessage(body));
+            }
+            await using (var dlqSender = client.CreateSender($"{queueName}/$deadletterqueue"))
+                await dlqSender.SendMessageAsync(new ServiceBusMessage("dead"));
+            await Task.Delay(200);
+        }
+
+        try
+        {
+            using var restarted = new BrokerFixture(dataDir);
+            Assert.Equal(3, restarted.GetQueue(queueName).MessageCount);
+            Assert.Equal(1, restarted.GetQueue(queueName).DeadLetterMessageCount);
+
+            await using var client = restarted.CreateServiceBusClient();
+            await using var dlqReceiver = client.CreateReceiver(queueName, new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+            var dead = await dlqReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+            Assert.NotNull(dead);
+            Assert.Equal("dead", dead.Body.ToString());
+        }
+        finally
+        {
+            try { Directory.Delete(dataDir, recursive: true); } catch { }
+        }
+    }
+
     [Fact]
     public async Task Restart_SequenceNumbersContinueFromPreviousMax()
     {

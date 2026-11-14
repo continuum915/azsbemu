@@ -13,7 +13,13 @@ public class Dispatcher : IDisposable
     private readonly ConcurrentDictionary<long, (DateTimeOffset LockedUntil, Guid LockToken)> _lockedAddresses = new();
     private TimeSpan _lockDuration = TimeSpan.FromSeconds(60);
     private readonly ConcurrentQueue<long> _redeliveryQueue = new();
+    // The session queue each delivered session message came from: abandoned and lock-expired session messages go back
+    // there, not to _redeliveryQueue, which only non-session receivers read.
+    private readonly ConcurrentDictionary<long, SessionMessageQueue> _sessionOfAddress = new();
     private readonly ConcurrentDictionary<long, int> _deliveryCountOverlay = new();
+    // Properties to modify from abandons and defers, applied whenever the message is read back. In memory, like the
+    // delivery count overlay: the stored record is immutable.
+    private readonly ConcurrentDictionary<long, IReadOnlyDictionary<string, object?>> _modifiedProperties = new();
     private readonly ConcurrentDictionary<long, long> _deferredMessages = new();
 
     // Maps each in-flight address to the NEXT record's start address.
@@ -30,11 +36,23 @@ public class Dispatcher : IDisposable
 
     private CancellationTokenSource? _monitorCts;
 
-    public Dispatcher(MessageStore store, ILogger logger)
+    // The entity's per-session queues of undelivered messages (session entities only). The delivery loop never reaches
+    // these messages, so truncation has to stop before the lowest of them, or a restart would lose them.
+    private readonly ConcurrentDictionary<string, SessionMessageQueue>? _sessionQueues;
+
+    public Dispatcher(MessageStore store, ILogger logger, ConcurrentDictionary<string, SessionMessageQueue>? sessionQueues = null)
     {
         _store = store;
         _logger = logger;
+        _sessionQueues = sessionQueues;
         _iterator = _store.Log.Scan(_store.Log.BeginAddress, long.MaxValue);
+    }
+
+    /// <summary>Lock duration for messages locked from now on (entity updates change it at runtime).</summary>
+    public TimeSpan LockDuration
+    {
+        get => _lockDuration;
+        set => _lockDuration = value;
     }
 
     public void StartLockMonitor(TimeSpan lockDuration, Func<long, Guid, Task> onExpired)
@@ -81,7 +99,7 @@ public class Dispatcher : IDisposable
     public async Task<(byte[] data, long address)?> TryDeliverNextAsync(
         Guid lockToken, 
         string? sessionId = null, 
-        ConcurrentDictionary<string, ConcurrentQueue<long>>? sessionQueues = null, 
+        ConcurrentDictionary<string, SessionMessageQueue>? sessionQueues = null, 
         CancellationToken ct = default)
     {
         if (!string.IsNullOrEmpty(sessionId) && sessionQueues != null)
@@ -101,16 +119,21 @@ public class Dispatcher : IDisposable
                         continue; // Already locked
                     }
 
+                    // Pending before the read: once dequeued, only the pending set holds truncation back. The record's
+                    // own address is a safe truncation bound until the read supplies the next record's address.
+                    _pendingAddresses.TryAdd(sessionAddr, sessionAddr);
                     try
                     {
-                        var (data, _) = await _store.ReadAsync(sessionAddr).ConfigureAwait(false);
+                        var (data, nextAddress) = await _store.ReadAsync(sessionAddr).ConfigureAwait(false);
                         _lockedAddresses[sessionAddr] = (DateTimeOffset.UtcNow + _lockDuration, lockToken);
-                        _pendingAddresses[sessionAddr] = sessionAddr + 1;
+                        _pendingAddresses[sessionAddr] = nextAddress;
+                        _sessionOfAddress[sessionAddr] = q;
                         return (data, sessionAddr);
                     }
                     catch (Exception ex)
                     {
                         _logger.LogWarning(ex, "Skipping unreadable session address {Address}", sessionAddr);
+                        _pendingAddresses.TryRemove(sessionAddr, out _);
                     }
                 }
             }
@@ -191,10 +214,7 @@ public class Dispatcher : IDisposable
         _ttlExpiredSet.TryRemove(address, out _); // clean up any stale TTL mark
         if (_lockedAddresses.TryGetValue(address, out var state) && state.LockToken == lockToken)
         {
-            _lockedAddresses.TryRemove(address, out _);
-            _deliveryCountOverlay.TryRemove(address, out _);
-            if (_pendingAddresses.TryRemove(address, out long nextAddr))
-                TruncateToMinPending(nextAddr);
+            Forget(address);
             return true;
         }
         return false;
@@ -204,25 +224,27 @@ public class Dispatcher : IDisposable
     /// Returns a message to the available pool. Removes the lock but retains the address in
     /// _pendingAddresses so the log is not truncated past it while it awaits redelivery.
     /// </summary>
-    public bool Abandon(long address, Guid lockToken)
+    public bool Abandon(long address, Guid lockToken, IReadOnlyDictionary<string, object?>? propertiesToModify = null)
     {
         if (_lockedAddresses.TryGetValue(address, out var state) && state.LockToken == lockToken)
         {
             if (_lockedAddresses.TryRemove(address, out _))
             {
-                _redeliveryQueue.Enqueue(address);
+                RecordModifiedProperties(address, propertiesToModify);
+                Redeliver(address);
                 return true;
             }
         }
         return false;
     }
 
-    public bool Defer(long address, Guid lockToken, long sequenceNumber)
+    public bool Defer(long address, Guid lockToken, long sequenceNumber, IReadOnlyDictionary<string, object?>? propertiesToModify = null)
     {
         if (_lockedAddresses.TryGetValue(address, out var state) && state.LockToken == lockToken)
         {
             if (_lockedAddresses.TryRemove(address, out _))
             {
+                RecordModifiedProperties(address, propertiesToModify);
                 _deferredMessages[sequenceNumber] = address;
                 // address stays in _pendingAddresses; deferred messages remain in the log
                 return true;
@@ -235,11 +257,48 @@ public class Dispatcher : IDisposable
     public void ForceComplete(long address)
     {
         _ttlExpiredSet.TryRemove(address, out _);
+        Forget(address);
+    }
+
+    /// <summary>
+    /// Drops everything tracked for a message that is finished with (completed, dead-lettered, discarded) and lets
+    /// the log be truncated past it. Per-message state added to the dispatcher must be removed here.
+    /// </summary>
+    private void Forget(long address)
+    {
         _lockedAddresses.TryRemove(address, out _);
         _deliveryCountOverlay.TryRemove(address, out _);
+        _modifiedProperties.TryRemove(address, out _);
+        _sessionOfAddress.TryRemove(address, out _);
         if (_pendingAddresses.TryRemove(address, out long nextAddr))
             TruncateToMinPending(nextAddr);
     }
+
+    private void RecordModifiedProperties(long address, IReadOnlyDictionary<string, object?>? propertiesToModify)
+    {
+        if (propertiesToModify is not { Count: > 0 }) return;
+        _modifiedProperties.AddOrUpdate(address, _ => new Dictionary<string, object?>(propertiesToModify), (_, existing) =>
+        {
+            var merged = new Dictionary<string, object?>(existing);
+            foreach (var (key, value) in propertiesToModify) merged[key] = value;
+            return merged;
+        });
+    }
+
+    /// <summary>Applies the properties earlier abandons and defers modified to a message read back from the log.</summary>
+    public void ApplyModifiedProperties(long address, Amqp.Message message)
+    {
+        if (_modifiedProperties.TryGetValue(address, out var properties))
+            PropertiesToModify.ApplyTo(properties, message);
+    }
+
+    /// <summary>
+    /// True if the message at this address has not been handed out yet: the delivery loop has not reached it and it
+    /// has not been retired as expired. Records behind the loop that are not tracked were completed or skipped; they
+    /// stay in the log until truncation passes them but are no longer messages.
+    /// </summary>
+    public bool IsAwaitingFirstDelivery(long address) =>
+        address >= _iterator.NextAddress && !_ttlExpiredSet.ContainsKey(address) && !IsTracked(address);
 
     /// <summary>Returns true if this address has been delivered (pending settlement or in redelivery queue).</summary>
     public bool IsTracked(long address) =>
@@ -251,10 +310,16 @@ public class Dispatcher : IDisposable
     /// </summary>
     public void MarkTtlExpired(long address) => _ttlExpiredSet[address] = 0;
 
+    /// <summary>
+    /// Makes an abandoned or lock-expired message available again: back to its session's queue for a session message,
+    /// otherwise to the redelivery queue. The address stays in _pendingAddresses until it is completed.
+    /// </summary>
     public void Redeliver(long address)
     {
-        _redeliveryQueue.Enqueue(address);
-        // address stays in _pendingAddresses until Complete
+        if (_sessionOfAddress.TryGetValue(address, out var sessionQueue))
+            sessionQueue.Enqueue(address);
+        else
+            _redeliveryQueue.Enqueue(address);
     }
 
     public int IncrementDeliveryCount(long address)
@@ -309,6 +374,14 @@ public class Dispatcher : IDisposable
             long truncateTo = _pendingAddresses.IsEmpty
                 ? completedNextAddress
                 : _pendingAddresses.Keys.Min();
+            if (_sessionQueues != null)
+            {
+                foreach (var sessionQueue in _sessionQueues.Values)
+                {
+                    if (sessionQueue.TryPeekLowest(out long undelivered) && undelivered < truncateTo)
+                        truncateTo = undelivered;
+                }
+            }
             _store.TruncateUntil(truncateTo);
         }
     }

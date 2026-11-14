@@ -19,6 +19,69 @@ internal static class SqlFilterEvaluator
         _ = Parse(expression);
     }
 
+    /// <summary>
+    /// Applies a SQL rule action to <paramref name="message"/> in place. Supported statements, separated by ';':
+    /// <c>SET &lt;property&gt; = &lt;literal or property&gt;</c> and <c>REMOVE &lt;property&gt;</c>, where a property is an
+    /// application property (optionally prefixed <c>user.</c>) or a <c>sys.</c> system property.
+    /// </summary>
+    public static void ApplyAction(string? action, Message message)
+    {
+        foreach (var statement in ParseAction(action))
+            statement.Apply(message);
+    }
+
+    public static void ValidateAction(string? action) => _ = ParseAction(action);
+
+    private static List<ActionStatement> ParseAction(string? action)
+    {
+        var statements = new List<ActionStatement>();
+        foreach (var text in SplitStatements(action ?? ""))
+        {
+            var parser = new Parser(text);
+            statements.Add(parser.ParseActionStatement());
+            parser.Expect(TokenKind.End);
+        }
+        return statements;
+    }
+
+    /// <summary>Splits on ';' outside single-quoted strings, dropping empty statements.</summary>
+    private static IEnumerable<string> SplitStatements(string action)
+    {
+        var current = new StringBuilder();
+        bool inString = false;
+        foreach (char c in action)
+        {
+            if (c == '\'') inString = !inString;
+            if (c == ';' && !inString)
+            {
+                if (current.ToString().Trim() is { Length: > 0 } statement) yield return statement;
+                current.Clear();
+                continue;
+            }
+            current.Append(c);
+        }
+        if (current.ToString().Trim() is { Length: > 0 } last) yield return last;
+    }
+
+    private abstract record ActionStatement(ValueReference Target)
+    {
+        public abstract void Apply(Message message);
+    }
+
+    private sealed record SetStatement(ValueReference Target, ValueNode Value) : ActionStatement(Target)
+    {
+        public override void Apply(Message message)
+        {
+            object? value = Value is ValueReference reference ? reference.Resolve(message) : Value.GetValue();
+            Target.Assign(message, value);
+        }
+    }
+
+    private sealed record RemoveStatement(ValueReference Target) : ActionStatement(Target)
+    {
+        public override void Apply(Message message) => Target.Remove(message);
+    }
+
     private static IExpression Parse(string? expression)
     {
         if (string.IsNullOrWhiteSpace(expression))
@@ -118,47 +181,91 @@ internal static class SqlFilterEvaluator
     {
         public override object? GetValue() => Name;
 
+        private bool IsSystem => Name.StartsWith("sys.", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>The application property name: <c>user.x</c> and <c>x</c> both mean property <c>x</c>.</summary>
+        private string UserPropertyName => Name.StartsWith("user.", StringComparison.OrdinalIgnoreCase) ? Name[5..] : Name;
+
         public object? Resolve(Message message)
         {
-            if (Name.StartsWith("sys.", StringComparison.OrdinalIgnoreCase))
+            if (IsSystem)
             {
                 return ResolveSystemProperty(message, Name[4..]);
             }
 
-            if (message.ApplicationProperties == null)
+            return FindUserPropertyKey(message) is { } key ? message.ApplicationProperties!.Map[key] : null;
+        }
+
+        public void Assign(Message message, object? value)
+        {
+            if (IsSystem)
             {
-                return null;
+                AssignSystemProperty(message, Name[4..], value);
+                return;
             }
 
+            message.ApplicationProperties ??= new ApplicationProperties();
+            // Overwrite an existing property under its own key (names match case-insensitively; keep its casing).
+            message.ApplicationProperties.Map[FindUserPropertyKey(message) ?? UserPropertyName] = value;
+        }
+
+        public void Remove(Message message)
+        {
+            if (IsSystem)
+            {
+                AssignSystemProperty(message, Name[4..], null); // system properties are fields: removing clears them
+                return;
+            }
+
+            if (FindUserPropertyKey(message) is { } key) message.ApplicationProperties!.Map.Remove(key);
+        }
+
+        private object? FindUserPropertyKey(Message message)
+        {
+            if (message.ApplicationProperties == null) return null;
             foreach (var key in message.ApplicationProperties.Map.Keys)
             {
-                if (key is string stringKey && string.Equals(stringKey, Name, StringComparison.OrdinalIgnoreCase))
-                {
-                    return message.ApplicationProperties.Map[key];
-                }
+                if (key is string stringKey && string.Equals(stringKey, UserPropertyName, StringComparison.OrdinalIgnoreCase))
+                    return key;
             }
-
             return null;
         }
 
-        private static object? ResolveSystemProperty(Message message, string propertyName)
+        private static void AssignSystemProperty(Message message, string propertyName, object? value)
         {
-            var properties = message.Properties;
+            if (!SystemProperties.TryGetValue(propertyName, out var property) || property.Set is null)
+                throw new ArgumentException($"System property 'sys.{propertyName}' cannot be set by a rule action.");
+            message.Properties ??= new Properties();
+            property.Set(message.Properties, value?.ToString());
+        }
 
-            return propertyName.ToLowerInvariant() switch
-            {
-                "correlationid" => properties?.CorrelationId,
-                "messageid" => properties?.MessageId,
-                "to" => properties?.To,
-                "replyto" => properties?.ReplyTo,
-                "label" or "subject" => properties?.Subject,
-                "sessionid" => properties?.GroupId,
-                "replytosessionid" => properties?.ReplyToGroupId,
-                "contenttype" => properties?.ContentType,
-                _ => null
-            };
+        private static object? ResolveSystemProperty(Message message, string propertyName) =>
+            message.Properties is { } properties && SystemProperties.TryGetValue(propertyName, out var property)
+                ? property.Get(properties)
+                : null;
+
+        /// <summary>Throws if a rule action may not SET or REMOVE this reference (an unknown or read-only system property).</summary>
+        public void EnsureAssignable()
+        {
+            if (IsSystem && (!SystemProperties.TryGetValue(Name[4..], out var property) || property.Set is null))
+                throw new ArgumentException($"System property '{Name}' cannot be set by a rule action.");
         }
     }
+
+    /// <summary>The <c>sys.</c> properties rules can read, and which of them actions can set (null setter: read-only).</summary>
+    private static readonly Dictionary<string, (Func<Properties, object?> Get, Action<Properties, string?>? Set)> SystemProperties =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CorrelationId"] = (p => p.CorrelationId, (p, v) => p.CorrelationId = v),
+            ["MessageId"] = (p => p.MessageId, (p, v) => p.MessageId = v),
+            ["To"] = (p => p.To, (p, v) => p.To = v),
+            ["ReplyTo"] = (p => p.ReplyTo, (p, v) => p.ReplyTo = v),
+            ["Label"] = (p => p.Subject, (p, v) => p.Subject = v),
+            ["Subject"] = (p => p.Subject, (p, v) => p.Subject = v),
+            ["SessionId"] = (p => p.GroupId, null),
+            ["ReplyToSessionId"] = (p => p.ReplyToGroupId, (p, v) => p.ReplyToGroupId = v),
+            ["ContentType"] = (p => p.ContentType, (p, v) => p.ContentType = v),
+        };
 
     private sealed class Parser
     {
@@ -172,6 +279,28 @@ internal static class SqlFilterEvaluator
         }
 
         public IExpression ParseExpression() => ParseOr();
+
+        public ActionStatement ParseActionStatement()
+        {
+            if (IsKeyword("SET"))
+            {
+                Advance();
+                var target = ParseReference();
+                target.EnsureAssignable();
+                Expect(TokenKind.Equal);
+                return new SetStatement(target, ParseValue());
+            }
+
+            if (IsKeyword("REMOVE"))
+            {
+                Advance();
+                var target = ParseReference();
+                target.EnsureAssignable();
+                return new RemoveStatement(target);
+            }
+
+            throw new ArgumentException($"Unsupported SQL rule action '{_current.Text}'; expected SET or REMOVE.");
+        }
 
         public void Expect(TokenKind kind)
         {
