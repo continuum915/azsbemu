@@ -34,19 +34,7 @@ public sealed class ManagementHttpHost : IAsyncDisposable
 
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
-        builder.WebHost.ConfigureKestrel(kestrel =>
-        {
-            if (host is "localhost" or "127.0.0.1" or "::1")
-            {
-                // Both loopback addresses: clients resolving "localhost" try ::1 first, and on Windows a refused
-                // IPv6 attempt costs ~2s per new connection before falling back to 127.0.0.1.
-                kestrel.ListenLocalhost(port == 0 ? FindFreeLoopbackPort() : port);
-            }
-            else
-            {
-                kestrel.ListenAnyIP(port);
-            }
-        });
+        builder.WebHost.ConfigureKestrel(kestrel => KestrelListen.On(kestrel, host, port));
 
         _app = builder.Build();
         _app.Run(HandleAsync);
@@ -91,6 +79,8 @@ public sealed class ManagementHttpHost : IAsyncDisposable
                 (ManagementPathKind.QueueList, "GET") => ListQueues(request),
                 (ManagementPathKind.TopicList, "GET") => ListTopics(request),
                 (ManagementPathKind.SubscriptionList, "GET") => ListSubscriptions(resource, request),
+                (ManagementPathKind.NamespaceInfo, "GET") =>
+                    (200, AtomSerializer.WriteNamespaceInfoEntry(request.Host.Host, StartedUtc, BaseAddress(request))),
                 (ManagementPathKind.NotSupported, _) => (501, AtomSerializer.WriteError(501, $"'{entityPath}' is not supported yet.")),
                 _ => (405, AtomSerializer.WriteError(405, $"Method {request.Method} is not supported on '{entityPath}'.")),
             };
@@ -111,16 +101,10 @@ public sealed class ManagementHttpHost : IAsyncDisposable
         await context.Response.WriteAsync(body).ConfigureAwait(false);
     }
 
-    private static int FindFreeLoopbackPort()
-    {
-        var probe = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        probe.Start();
-        int port = ((IPEndPoint)probe.LocalEndpoint).Port;
-        probe.Stop();
-        return port;
-    }
-
     private static string BaseAddress(HttpRequest request) => $"{request.Scheme}://{request.Host}";
+
+    /// <summary>Reported as the namespace's creation time.</summary>
+    private static readonly DateTime StartedUtc = DateTime.UtcNow;
 
     private (int, string) GetEntity(string name, HttpRequest request)
     {

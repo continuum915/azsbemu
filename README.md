@@ -5,7 +5,7 @@ A local Azure Service Bus emulator for development and integration tests. It spe
 ## Run
 
 ```bash
-docker run -d --name azsbemu -p 5672:5672 -p 80:8080 -v azsbemu-data:/app/data ghcr.io/continuum915/azsbemu:latest
+docker run -d --name azsbemu -p 5672:5672 -p 80:8080 -p 8081:8081 -v azsbemu-data:/app/data ghcr.io/continuum915/azsbemu:latest
 ```
 
 Pin a version tag (for example `:0.1.0`) in shared setups. Images are built for amd64 and arm64.
@@ -17,6 +17,19 @@ Endpoint=sb://localhost/;SharedAccessKeyName=Root;SharedAccessKey=dummy;UseDevel
 ```
 
 Leave the port out of the endpoint. The client then uses AMQP on 5672 and the administration client uses HTTP on 80, so one string drives both. This needs Azure.Messaging.ServiceBus 7.18 or later.
+
+## Browse
+
+Open `http://localhost:8081` for SbBrowser, a web UI already connected to the emulator. It lists queues, topics and subscriptions with their counts, rules and forwarding, pages through active and dead-letter messages (sessions too), and can send, receive-and-delete and purge. It has no sign-in, so don't publish port 8081 where others can reach it.
+
+SbBrowser also runs on its own against any namespace, including Azure. Publish it as one self-contained executable:
+
+```powershell
+./SbBrowser/publish.ps1                      # publish/SbBrowser/win-x64/SbBrowser.App.exe
+./SbBrowser/publish.ps1 -Runtime linux-x64   # or osx-arm64, ...
+```
+
+It listens on `http://127.0.0.1:8081` (`--port` to change it, `--urls` to listen beyond loopback) and opens your browser (`--no-browser` to skip). Connections are saved unencrypted in `%APPDATA%\SbBrowser\profiles.json` (`~/.config/SbBrowser` elsewhere).
 
 ## MassTransit
 
@@ -52,6 +65,7 @@ x.UsingAzureServiceBus((context, cfg) =>
 | Listen address | `AZSB_EMU_Host` | `0.0.0.0` |
 | AMQP port | `AZSB_EMU_Port` | `5672` |
 | HTTP management port | `AZSB_EMU_HttpPort` | `8080` (publish as host port 80) |
+| SbBrowser port | `AZSB_EMU_BrowserPort` | `8081` (`0` turns it off) |
 | Data directory | `AZSB_EMU_DataDirectory` | `/app/data` |
 
 ## Build and test

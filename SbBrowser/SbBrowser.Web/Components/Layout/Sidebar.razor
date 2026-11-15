@@ -1,0 +1,219 @@
+@implements IDisposable
+@inject BrowserSession Session
+@inject NavigationManager Navigation
+@inject IJSRuntime JS
+
+<nav class="sb-side" aria-label="Entities">
+    <div class="sb-side-head">
+        <a class="sb-brand" href="">
+            <span class="sb-logo"><Icon Kind="logo" Size="16" /></span>
+            @SbBrowserInfo.Name
+        </a>
+
+        <ProfilePicker />
+
+        <div class="sb-search">
+            <label class="sr-only" for="sb-filter">Filter queues, topics and subscriptions</label>
+            <Icon Kind="search" Size="14" />
+            <input id="sb-filter" type="search" placeholder="Filter queues, topics, subs" autocomplete="off"
+                   @bind="filter" @bind:event="oninput" @onkeydown="OnFilterKey" />
+            <kbd>Ctrl K</kbd>
+        </div>
+
+        <div class="sb-chips" role="group" aria-label="Show">
+            <button class="toggle" aria-pressed="@(show == Show.All ? "true" : "false")" @onclick="() => show = Show.All">All</button>
+            <button class="toggle" aria-pressed="@(show == Show.WithMessages ? "true" : "false")" @onclick="() => show = Show.WithMessages">Has messages</button>
+            <button class="toggle toggle-dl" aria-pressed="@(show == Show.DeadLetters ? "true" : "false")" @onclick="() => show = Show.DeadLetters">Dead letters · @DeadLetterEntityCount</button>
+        </div>
+    </div>
+
+    <div class="sb-tree">
+        <a class="sb-row @Selected("overview")" href="">
+            <Icon Kind="overview" />
+            <span style="font-weight: 500">Overview</span>
+        </a>
+
+        @{
+            var topics = VisibleTopics().ToList();
+            var queues = VisibleQueues().ToList();
+        }
+
+        <div class="sb-section">
+            <span class="label">Topics · @topics.Count</span>
+            <span class="muted" style="font-size: 11px">@Fmt.Plural(Session.Tree.Subscriptions.Count(), "subscription", "subscriptions")</span>
+        </div>
+        @foreach (var (topic, subs) in topics)
+        {
+            bool collapsed = collapsedTopics.Contains(topic.Ref.Name) && !Filtering;
+            <div>
+                <div class="sb-row @Selected(Links.KeyOf(topic.Ref))" style="padding-left: 4px">
+                    <button class="sb-twisty" aria-expanded="@(collapsed ? "false" : "true")"
+                            aria-label="@(collapsed ? "Show" : "Hide") subscriptions of @topic.Ref.Name"
+                            @onclick="() => ToggleTopic(topic.Ref.Name)">
+                        <Icon Kind="@(collapsed ? "chevron-right" : "chevron-down")" Size="13" />
+                    </button>
+                    <a href="@Links.Topic(topic.Ref.Name)" style="display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; color: inherit; text-decoration: none">
+                        <Icon Kind="topic" Class="ico-topic" />
+                        <span class="sb-row-name ellipsis" style="flex: 1" title="@topic.Ref.Name">@topic.Ref.Name</span>
+                        <span class="muted" style="font-size: 11px" title="Subscriptions">@topic.Subscriptions.Count</span>
+                    </a>
+                </div>
+                @if (!collapsed && subs.Count > 0)
+                {
+                    <div class="sb-subs">
+                        @foreach (var sub in subs)
+                        {
+                            <a class="sb-row @Selected(Links.KeyOf(sub.Ref))" href="@Links.Subscription(sub.Ref.Topic, sub.Ref.Name)">
+                                <div class="sb-row-text">
+                                    <span class="sb-row-name ellipsis" title="@sub.Ref.Name">@sub.Ref.Name</span>
+                                    @if (sub.Settings.ForwardTo is { } fwd)
+                                    {
+                                        <span class="sb-row-fwd ellipsis" title="Forwards to @fwd">→ @fwd</span>
+                                    }
+                                    else if (!sub.ReceivesAll)
+                                    {
+                                        <span class="sb-row-sub mono ellipsis" title="@Fmt.Filter(sub)">ƒ @Fmt.Filter(sub)</span>
+                                    }
+                                </div>
+                                <CountPills Counts="sub.Counts" />
+                            </a>
+                        }
+                    </div>
+                }
+            </div>
+        }
+
+        <div class="sb-section">
+            <span class="label">Queues · @queues.Count</span>
+        </div>
+        @foreach (var queue in queues)
+        {
+            int feeders = Session.Tree.FeedersOf(queue.Ref.Name).Count;
+            string? fault = Fmt.FaultKind(queue.Ref.Name);
+            <a class="sb-row @Selected(Links.KeyOf(queue.Ref))" href="@Links.Queue(queue.Ref.Name)">
+                <Icon Kind="queue" Class="ico-queue" />
+                <div class="sb-row-text">
+                    <span class="sb-row-name ellipsis" title="@queue.Ref.Name">@queue.Ref.Name</span>
+                    @if (queue.Settings.ForwardTo is { } fwd)
+                    {
+                        <span class="sb-row-fwd ellipsis">→ @fwd</span>
+                    }
+                    else if (feeders > 0)
+                    {
+                        <span class="sb-row-sub">← fed by @Fmt.Plural(feeders, "entity", "entities")</span>
+                    }
+                    @if (fault is not null)
+                    {
+                        <span class="sb-row-fault">@fault</span>
+                    }
+                </div>
+                <CountPills Counts="queue.Counts" />
+            </a>
+        }
+
+        @if (topics.Count == 0 && queues.Count == 0 && Session.Connected)
+        {
+            <div class="sb-empty">
+                @if (Filtering || show != Show.All)
+                {
+                    <text>Nothing matches.</text>
+                }
+                else
+                {
+                    <text>This namespace has no queues or topics yet.</text>
+                }
+            </div>
+        }
+    </div>
+
+    <div class="sb-side-foot">
+        <span aria-live="polite">@(Session.Loading ? "Refreshing…" : "Refreshed " + Fmt.Ago(Session.RefreshedAt))</span>
+        <div style="display: flex; gap: 6px">
+            <button class="btn btn-icon btn-small" style="width: 30px; height: 30px" aria-label="Switch light or dark theme" title="Switch theme" @onclick="ToggleThemeAsync">
+                <Icon Kind="theme" Size="14" />
+            </button>
+            <button class="btn btn-icon btn-small" style="width: 30px; height: 30px" aria-label="Refresh counts" title="Refresh" disabled="@Session.Loading" @onclick="Session.RefreshAsync">
+                <Icon Kind="refresh" Size="14" />
+            </button>
+        </div>
+    </div>
+</nav>
+
+@code {
+    private enum Show { All, WithMessages, DeadLetters }
+
+    private string filter = "";
+    private Show show = Show.All;
+    private readonly HashSet<string> collapsedTopics = new(StringComparer.OrdinalIgnoreCase);
+    private string currentKey = "overview";
+    private Timer? ticker;
+
+    private bool Filtering => !string.IsNullOrWhiteSpace(filter);
+
+    private int DeadLetterEntityCount =>
+        Session.Tree.Queues.Count(q => q.Counts.AllDeadLetters > 0) + Session.Tree.Subscriptions.Count(s => s.Counts.AllDeadLetters > 0);
+
+    protected override void OnInitialized()
+    {
+        currentKey = Links.CurrentKey(Navigation);
+        Navigation.LocationChanged += OnLocationChanged;
+        Session.Changed += OnSessionChanged;
+        // Keep "Refreshed 20s ago" honest without refreshing anything.
+        ticker = new Timer(_ => InvokeAsync(StateHasChanged), null, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+    }
+
+    private IEnumerable<(TopicNode Topic, List<SubscriptionNode> Subs)> VisibleTopics()
+    {
+        foreach (var topic in Session.Tree.Topics)
+        {
+            bool topicMatches = Matches(topic.Ref.Name);
+            var subs = topic.Subscriptions
+                .Where(s => (topicMatches || Matches(s.Ref.Name) || Matches(s.Settings.ForwardTo)) && Passes(s.Counts))
+                .ToList();
+            if (subs.Count > 0 || (topicMatches && show == Show.All))
+                yield return (topic, subs);
+        }
+    }
+
+    private IEnumerable<QueueNode> VisibleQueues() =>
+        Session.Tree.Queues.Where(q => Matches(q.Ref.Name) && Passes(q.Counts));
+
+    private bool Matches(string? name) =>
+        !Filtering || (name is not null && name.Contains(filter.Trim(), StringComparison.OrdinalIgnoreCase));
+
+    private bool Passes(EntityCounts counts) => show switch
+    {
+        Show.WithMessages => counts.Total > 0,
+        Show.DeadLetters => counts.AllDeadLetters > 0,
+        _ => true,
+    };
+
+    private string Selected(string key) => string.Equals(key, currentKey, StringComparison.OrdinalIgnoreCase) ? "selected" : "";
+
+    private void ToggleTopic(string name)
+    {
+        if (!collapsedTopics.Remove(name)) collapsedTopics.Add(name);
+    }
+
+    private void OnFilterKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") filter = "";
+    }
+
+    private async Task ToggleThemeAsync() => await JS.InvokeAsync<string>("sbBrowser.toggleTheme");
+
+    private void OnLocationChanged(object? sender, LocationChangedEventArgs e)
+    {
+        currentKey = Links.CurrentKey(Navigation);
+        InvokeAsync(StateHasChanged);
+    }
+
+    private void OnSessionChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        Navigation.LocationChanged -= OnLocationChanged;
+        Session.Changed -= OnSessionChanged;
+        ticker?.Dispose();
+    }
+}

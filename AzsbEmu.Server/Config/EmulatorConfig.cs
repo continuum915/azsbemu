@@ -9,6 +9,8 @@ public class EmulatorConfig
     /// connects to port 80 when UseDevelopmentEmulator=true, so only change this behind a port mapping.
     /// </summary>
     public int HttpPort { get; set; } = 80;
+    /// <summary>Port SbBrowser, the web UI for browsing entities and messages, is served on. 0 turns it off.</summary>
+    public int BrowserPort { get; set; } = 8081;
     public string DataDirectory { get; set; } = "";
     public List<QueueConfig> Queues { get; set; } = new();
     public List<TopicConfig> Topics { get; set; } = new();

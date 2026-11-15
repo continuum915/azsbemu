@@ -1,0 +1,141 @@
+@implements IDisposable
+@inject BrowserSession Session
+
+@* Purge: confirm (entity, source, count) → running (live progress, Cancel) → result (what was removed and what
+   a purge cannot remove). Nothing is removed until the danger button is pressed. *@
+<Modal Title="@Title" OnClose="OnClose" CanClose="!running">
+    <div class="modal-body">
+        @if (!running && result is null)
+        {
+            <p class="confirm-text">
+                Delete <strong>all @Fmt.Count(CurrentCount) @SourceText</strong> from
+                <span class="mono">@Entity.DisplayName</span>? Removed messages are gone: there is no undo.
+            </p>
+            <p class="note">
+                Scheduled messages@(Source == MessageSource.Active ? " and deferred messages" : " and deferred dead letters") stay: a purge cannot receive them.
+                @if (Source == MessageSource.Active && NeedsSession)
+                {
+                    <text> Sessions are purged one at a time; a session another receiver holds is skipped.</text>
+                }
+            </p>
+            @if (error is not null)
+            {
+                <ul class="form-errors" role="alert"><li>@error</li></ul>
+            }
+            <div class="modal-foot">
+                <button class="btn" @onclick="OnClose">Cancel</button>
+                <button class="btn btn-danger" @onclick="PurgeAsync">Purge @SourceText</button>
+            </div>
+        }
+        else if (running)
+        {
+            <p class="confirm-text" role="status" aria-live="polite">
+                Purging <span class="mono">@Entity.DisplayName</span>: removed <strong>@Fmt.Count(removedSoFar)</strong>@(CurrentCount > 0 ? $" of about {Fmt.Count(CurrentCount)}" : "").
+            </p>
+            <div class="progress" role="progressbar" aria-label="Purge progress" aria-valuemin="0" aria-valuemax="@CurrentCount" aria-valuenow="@removedSoFar">
+                <div class="progress-bar @(Fraction is null ? "indeterminate" : "")" style="width: @((Fraction ?? 0.3) * 100)%"></div>
+            </div>
+            <div class="modal-foot">
+                <button class="btn" @onclick="Cancel" disabled="@(cancellation?.IsCancellationRequested == true)">
+                    @(cancellation?.IsCancellationRequested == true ? "Cancelling…" : "Cancel")
+                </button>
+            </div>
+        }
+        else if (result is not null)
+        {
+            <p class="form-ok" role="status">
+                @(result.Cancelled ? "Cancelled after removing" : "Removed") @Fmt.Plural(result.Removed, "message", "messages")
+                from <span class="mono">@Entity.DisplayName</span>.
+            </p>
+            <table class="kv">
+                <tbody>
+                    <tr>
+                        <td>@(Source == MessageSource.DeadLetter ? "Dead letters left" : "Active messages left")</td>
+                        <td class="mono">@Fmt.Count(result.DeferredRemaining)</td>
+                    </tr>
+                    <tr>
+                        <td>Scheduled messages left</td>
+                        <td class="mono">@Fmt.Count(result.ScheduledRemaining)</td>
+                    </tr>
+                </tbody>
+            </table>
+            @if (result.DeferredRemaining > 0 && !result.Cancelled)
+            {
+                <p class="note">
+                    What is left could not be received: deferred messages (only a receive by sequence number takes them),
+                    messages in a session another receiver holds, or messages that arrived during the purge.
+                </p>
+            }
+            @if (result.ScheduledRemaining > 0)
+            {
+                <p class="note">Scheduled messages become active at their scheduled time.</p>
+            }
+            <div class="modal-foot">
+                <button class="btn btn-primary" @onclick="OnClose">Done</button>
+            </div>
+        }
+    </div>
+</Modal>
+
+@code {
+    [Parameter, EditorRequired] public EntityRef Entity { get; set; } = null!;
+    [Parameter] public MessageSource Source { get; set; }
+    /// <summary>The entity's count for <see cref="Source"/>, shown in the confirmation and as the progress total.</summary>
+    [Parameter] public long CurrentCount { get; set; }
+    /// <summary>True when the entity's active messages are in sessions.</summary>
+    [Parameter] public bool NeedsSession { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+    /// <summary>Called when the purge ends (finished, cancelled or failed), so the page can refresh.</summary>
+    [Parameter] public EventCallback OnChanged { get; set; }
+
+    private bool running;
+    private long removedSoFar;
+    private PurgeResult? result;
+    private string? error;
+    private CancellationTokenSource? cancellation;
+
+    private string SourceText => Fmt.Source(Source);
+
+    private string Title => Source == MessageSource.DeadLetter ? "Purge dead letters" : "Purge active messages";
+
+    /// <summary>How far along the bar is; null when the total is unknown or already passed (messages kept arriving).</summary>
+    private double? Fraction => CurrentCount > 0 && removedSoFar <= CurrentCount ? (double)removedSoFar / CurrentCount : null;
+
+    private async Task PurgeAsync()
+    {
+        var connection = Session.Connection;
+        if (connection is null)
+        {
+            error = "There is no connection.";
+            return;
+        }
+
+        error = null;
+        running = true;
+        removedSoFar = 0;
+        cancellation = new CancellationTokenSource();
+        // Reports arrive on the purge's thread; render them on the component's.
+        var progress = new Progress<PurgeProgress>(p => _ = InvokeAsync(() =>
+        {
+            removedSoFar = Math.Max(removedSoFar, p.Removed);
+            StateHasChanged();
+        }));
+        try
+        {
+            result = await connection.PurgeAsync(Entity, Source, progress, cancellation.Token);
+        }
+        catch (Exception ex)
+        {
+            error = $"The purge stopped after removing {Fmt.Plural(removedSoFar, "message", "messages")}: {ErrorText.Describe(ex)}";
+        }
+        finally
+        {
+            running = false;
+        }
+        await OnChanged.InvokeAsync();
+    }
+
+    private void Cancel() => cancellation?.Cancel();
+
+    public void Dispose() => cancellation?.Cancel();
+}

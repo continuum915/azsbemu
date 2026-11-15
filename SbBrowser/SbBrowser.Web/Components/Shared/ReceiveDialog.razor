@@ -1,0 +1,193 @@
+@implements IDisposable
+@inject BrowserSession Session
+
+@* Receive-and-delete: asks for N (and a session where the entity needs one), says what will be removed, then lists
+   what was. Nothing is removed until the danger button is pressed. *@
+<Modal Title="@(Source == MessageSource.DeadLetter ? "Receive & delete dead letters" : "Receive & delete")" OnClose="OnClose" CanClose="!running" Class="@(removed is { Count: > 0 } ? "modal-wide" : null)">
+    @if (removed is null)
+    {
+        @* Not a <form>: Enter in the count field must not delete anything; only the button does. *@
+        <div class="modal-body form">
+            <p class="confirm-text">
+                Removes up to <strong>@Fmt.Count(count)</strong> @SourceText from
+                <span class="mono">@Entity.DisplayName</span>, which has <strong>@Fmt.Count(CurrentCount)</strong>.
+                Removed messages are gone: there is no undo.
+            </p>
+            <div class="form-row">
+                <label>
+                    How many
+                    <input class="input" type="number" min="1" max="@NamespaceConnection.MaxReceiveCount" @bind="count" @bind:event="oninput" />
+                </label>
+                @if (NeedsSession)
+                {
+                    <label>
+                        Session ID
+                        <input class="input" @bind="sessionId" placeholder="next available session" />
+                    </label>
+                }
+            </div>
+            @if (NeedsSession)
+            {
+                <span class="note">Leave the session ID empty to take the next session that has messages.</span>
+            }
+            @if (error is not null)
+            {
+                <ul class="form-errors" role="alert"><li>@error</li></ul>
+            }
+            <div class="modal-foot">
+                @if (running)
+                {
+                    <span class="muted" style="font-size: 12.5px">Receiving…</span>
+                    <button type="button" class="btn" @onclick="Cancel">Cancel</button>
+                }
+                else
+                {
+                    <button type="button" class="btn" @onclick="OnClose">Cancel</button>
+                    <button type="button" class="btn btn-danger" disabled="@(count < 1)" @onclick="ReceiveAsync">Receive &amp; delete @Fmt.Count(count)</button>
+                }
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="modal-body">
+            <p class="form-ok" role="status">
+                @if (cancelled)
+                {
+                    <text>Cancelled. Any messages received before the cancel are removed but cannot be listed; the counts show what is left.</text>
+                }
+                else
+                {
+                    <text>Removed @Fmt.Plural(removed.Count, "message", "messages") from </text><span class="mono">@Entity.DisplayName</span><text>.</text>
+                    @if (removed.Count < requested)
+                    {
+                        <text> It ran dry before @Fmt.Count(requested).</text>
+                    }
+                }
+            </p>
+            @if (removed.Count > 0)
+            {
+                <div class="split">
+                    <div class="card grid-panel" style="max-height: 420px; overflow: auto">
+                        <table class="grid" style="min-width: 0">
+                            <thead>
+                                <tr>
+                                    <th class="label">Seq</th>
+                                    <th class="label">Message ID</th>
+                                    <th class="label">Subject</th>
+                                    <th class="label" style="text-align: right">Size</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var message in removed)
+                                {
+                                    <tr class="@(message == selected ? "selected" : "")" @onclick="() => selected = message">
+                                        <td><button class="seq" aria-label="Show message @message.SequenceNumber" @onclick="() => selected = message">@message.SequenceNumber</button></td>
+                                        <td class="mono" style="color: var(--text-2)" title="@message.MessageId">@message.MessageId</td>
+                                        <td title="@message.Subject">@message.Subject</td>
+                                        <td class="num" style="color: var(--text-2)">@Fmt.Size(message.SizeBytes)</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                    @if (selected is not null)
+                    {
+                        <MessageDetails Message="selected" DeadLetter="Source == MessageSource.DeadLetter" />
+                    }
+                </div>
+            }
+            <div class="modal-foot">
+                <button class="btn" @onclick="Again">Receive more…</button>
+                <button class="btn btn-primary" @onclick="OnClose">Done</button>
+            </div>
+        </div>
+    }
+</Modal>
+
+@code {
+    [Parameter, EditorRequired] public EntityRef Entity { get; set; } = null!;
+    [Parameter] public MessageSource Source { get; set; }
+    /// <summary>The entity's count for <see cref="Source"/>, shown in the confirmation.</summary>
+    [Parameter] public long CurrentCount { get; set; }
+    /// <summary>True when the entity's active messages need a session.</summary>
+    [Parameter] public bool NeedsSession { get; set; }
+    /// <summary>The session the page is showing, used as the default.</summary>
+    [Parameter] public string? SessionId { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+    /// <summary>Called after messages were removed, so the page can refresh.</summary>
+    [Parameter] public EventCallback OnChanged { get; set; }
+
+    private int count = 10;
+    private string? sessionId;
+    private bool running;
+    private bool cancelled;
+    private int requested;
+    private string? error;
+    private CancellationTokenSource? cancellation;
+    private IReadOnlyList<MessageView>? removed;
+    private MessageView? selected;
+
+    private string SourceText => Fmt.Source(Source);
+
+    protected override void OnInitialized()
+    {
+        sessionId = SessionId;
+        if (CurrentCount is > 0 and < 10) count = (int)CurrentCount;
+    }
+
+    private async Task ReceiveAsync()
+    {
+        error = null;
+        var connection = Session.Connection;
+        if (connection is null)
+        {
+            error = "There is no connection.";
+            return;
+        }
+        if (count < 1 || count > NamespaceConnection.MaxReceiveCount)
+        {
+            error = $"Choose between 1 and {Fmt.Count(NamespaceConnection.MaxReceiveCount)} messages.";
+            return;
+        }
+
+        var session = NeedsSession
+            ? string.IsNullOrWhiteSpace(sessionId) ? SessionChoice.NextAvailable : SessionChoice.Id(sessionId.Trim())
+            : null;
+        running = true;
+        cancelled = false;
+        requested = count;
+        cancellation = new CancellationTokenSource();
+        try
+        {
+            removed = await connection.ReceiveAndDeleteAsync(Entity, Source, count, session, cancellation.Token);
+            selected = removed.FirstOrDefault();
+        }
+        catch (Exception) when (cancellation.IsCancellationRequested)
+        {
+            // A cancel surfaces as OperationCanceledException or, mid-receive, as a service timeout: either way it was the cancel.
+            cancelled = true;
+            removed = [];
+        }
+        catch (Exception ex)
+        {
+            error = ErrorText.Describe(ex);
+        }
+        finally
+        {
+            running = false;
+        }
+        // Even a failed receive may have removed some messages before it stopped.
+        await OnChanged.InvokeAsync();
+    }
+
+    private void Again()
+    {
+        removed = null;
+        selected = null;
+    }
+
+    private void Cancel() => cancellation?.Cancel();
+
+    public void Dispose() => cancellation?.Cancel();
+}

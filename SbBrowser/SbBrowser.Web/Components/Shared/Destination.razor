@@ -1,0 +1,43 @@
+@* Where a queue or subscription sends its messages: the forward target, or "held here" when consumers read it. *@
+<span style="display: flex; flex-direction: column; gap: 2px; min-width: 0">
+    @if (Settings.ForwardTo is { } target)
+    {
+        var entity = Tree.FindQueueOrTopic(target);
+        <span class="dest">
+            <Icon Kind="arrow" Size="16" Class="ico-queue" />
+            <span class="muted" style="font-size: 11px">@(entity is TopicRef ? "topic" : "queue")</span>
+            @if (entity is not null)
+            {
+                <a class="ellipsis" href="@Links.To(entity)" title="@target">@target</a>
+            }
+            else
+            {
+                <span class="mono ellipsis dest-dropped" title="This entity does not exist">@target (missing)</span>
+            }
+        </span>
+    }
+    else
+    {
+        <span class="dest-held">Held here for consumers</span>
+    }
+    @if (Settings.ForwardDeadLetteredMessagesTo is { } dlTarget)
+    {
+        var dlEntity = Tree.FindQueueOrTopic(dlTarget);
+        <span class="muted" style="font-size: 11.5px">
+            dead letters →
+            @if (dlEntity is not null)
+            {
+                <a class="mono" href="@Links.To(dlEntity)">@dlTarget</a>
+            }
+            else
+            {
+                <span class="mono">@dlTarget</span>
+            }
+        </span>
+    }
+</span>
+
+@code {
+    [Parameter, EditorRequired] public NamespaceTree Tree { get; set; } = NamespaceTree.Empty;
+    [Parameter, EditorRequired] public ReceiverSettings Settings { get; set; } = null!;
+}

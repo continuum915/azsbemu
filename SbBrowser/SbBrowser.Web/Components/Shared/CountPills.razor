@@ -1,0 +1,17 @@
+@* Active and dead-letter counts for a queue or subscription. Zero counts are hidden unless ShowZero is set. *@
+@if (Counts.Active > 0 || ShowZero)
+{
+    <span class="pill @(Counts.Active > 0 ? "pill-active" : "pill-zero")" title="Active messages">@Fmt.Count(Counts.Active)@Suffix(" active")</span>
+}
+@if (Counts.AllDeadLetters > 0 || ShowZero)
+{
+    <span class="pill @(Counts.AllDeadLetters > 0 ? "pill-dl" : "pill-zero")" title="Dead letters">@Fmt.Count(Counts.AllDeadLetters)@Suffix(" dead")</span>
+}
+
+@code {
+    [Parameter, EditorRequired] public EntityCounts Counts { get; set; } = EntityCounts.None;
+    [Parameter] public bool ShowZero { get; set; }
+    [Parameter] public bool Labels { get; set; }
+
+    private string Suffix(string label) => Labels ? label : "";
+}

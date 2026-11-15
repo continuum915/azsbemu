@@ -1,0 +1,13 @@
+@* One system-property row; properties the message does not set are left out. *@
+@if (!string.IsNullOrEmpty(Value))
+{
+    <tr>
+        <td>@Name</td>
+        <td class="mono">@Value</td>
+    </tr>
+}
+
+@code {
+    [Parameter, EditorRequired] public string Name { get; set; } = "";
+    [Parameter] public string? Value { get; set; }
+}

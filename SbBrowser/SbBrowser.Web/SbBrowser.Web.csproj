@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <!-- SbBrowser's Blazor (interactive server) UI as a library, hosted by SbBrowser.App and by the emulator. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SbBrowser.Core\SbBrowser.Core.csproj" />
+  </ItemGroup>
+
+</Project>

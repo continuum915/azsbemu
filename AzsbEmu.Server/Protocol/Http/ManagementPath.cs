@@ -16,6 +16,8 @@ internal enum ManagementPathKind
     SubscriptionList,
     /// <summary><c>{topic}/Subscriptions/{subscription}/Rules</c>.</summary>
     RuleList,
+    /// <summary><c>$namespaceinfo</c>: the namespace's name, SKU and creation time.</summary>
+    NamespaceInfo,
     /// <summary>A reserved path the API does not serve (other <c>$</c>-prefixed resources).</summary>
     NotSupported,
 }
@@ -37,6 +39,8 @@ internal readonly record struct ManagementPath(ManagementPathKind Kind, string E
             return new ManagementPath(ManagementPathKind.QueueList, "");
         if (path.Equals("$Resources/topics", StringComparison.OrdinalIgnoreCase))
             return new ManagementPath(ManagementPathKind.TopicList, "");
+        if (path.Equals("$namespaceinfo", StringComparison.OrdinalIgnoreCase))
+            return new ManagementPath(ManagementPathKind.NamespaceInfo, "");
         if (path.StartsWith('$'))
             return new ManagementPath(ManagementPathKind.NotSupported, "");
 

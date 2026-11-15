@@ -32,6 +32,16 @@ public class ManagementHttpQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task GetNamespaceProperties_DescribesTheEmulatorAsAStandardNamespace()
+    {
+        // Tools such as Purple Explorer call this first when connecting.
+        NamespaceProperties ns = await _admin.GetNamespacePropertiesAsync();
+        Assert.False(string.IsNullOrEmpty(ns.Name));
+        Assert.Equal(MessagingSku.Standard, ns.MessagingSku);
+        Assert.True(ns.CreatedTime <= DateTimeOffset.UtcNow);
+    }
+
+    [Fact]
     public async Task GetQueue_OnAMissingName_RaisesNotFound_AndQueueExistsReportsBothCases()
     {
         var ex = await Assert.ThrowsAsync<ServiceBusException>(() => _admin.GetQueueAsync("never-created"));

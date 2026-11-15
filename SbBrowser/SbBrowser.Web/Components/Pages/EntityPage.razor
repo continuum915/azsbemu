@@ -1,0 +1,475 @@
+@page "/queue"
+@page "/subscription"
+@implements IDisposable
+@inject BrowserSession Session
+@inject NavigationManager Navigation
+
+<PageTitle>@(Name ?? "") @(DeadLetters ? "dead letters" : "messages") · @SbBrowserInfo.Name</PageTitle>
+
+<nav aria-label="Breadcrumb" class="crumbs">
+    <a href="">Overview</a><span aria-hidden="true">/</span>
+    @if (IsSubscription)
+    {
+        <a class="mono" href="@Links.Topic(Topic ?? "")">@Topic</a><span aria-hidden="true">/</span><span>Subscriptions</span>
+    }
+    else
+    {
+        <span>Queues</span>
+    }
+</nav>
+
+@if (entity is null || settings is null)
+{
+    <div class="card empty-state">
+        @if (Session.Loading || !Session.Connected)
+        {
+            <span>Loading…</span>
+        }
+        else
+        {
+            <h2>@(IsSubscription ? "Subscription" : "Queue") not found</h2>
+            <p>There is no @(IsSubscription ? $"subscription {Name} on topic {Topic}" : $"queue named {Name}") in this namespace.</p>
+        }
+    </div>
+}
+else
+{
+    <header class="page-head">
+        <div>
+            <div class="page-title">
+                <Icon Kind="@(IsSubscription ? "sub" : "queue")" Size="20" Class="@(IsSubscription ? "ico-sub" : "ico-queue")" />
+                <h1 class="mono">@entity.DisplayName</h1>
+                @if (entity is SubscriptionRef subRef)
+                {
+                    <span class="muted" style="font-size: 13px">subscription of <a class="mono" href="@Links.Topic(subRef.Topic)">@subRef.Topic</a></span>
+                }
+                @if (Fmt.FaultKind(entity.DisplayName) is { } fault && !IsSubscription)
+                {
+                    <span class="chip" style="color: var(--dl-fg)">@fault</span>
+                }
+            </div>
+            <div class="page-meta">
+                @if (subscription is not null)
+                {
+                    <FilterChip Subscription="subscription" />
+                }
+                @if (settings.ForwardTo is { } fwd)
+                {
+                    var target = Session.Tree.FindQueueOrTopic(fwd);
+                    <span class="chip">
+                        Forwards to
+                        @if (target is not null)
+                        {
+                            <a class="mono" href="@Links.To(target)">@fwd</a>
+                        }
+                        else
+                        {
+                            <span class="mono">@fwd</span>
+                        }
+                    </span>
+                }
+                else
+                {
+                    <span class="chip">Not forwarded: consumers read here</span>
+                }
+                @if (settings.ForwardDeadLetteredMessagesTo is { } dlFwd)
+                {
+                    <span class="chip">Dead letters to <span class="mono">@dlFwd</span></span>
+                }
+                @if (feeders.Count > 0)
+                {
+                    <span class="chip">
+                        ← fed by
+                        @foreach (var f in feeders)
+                        {
+                            <a class="mono" href="@Links.To(f.Source)">@FeederName(f)</a>
+                        }
+                    </span>
+                }
+                @if (settings.RequiresSession)
+                {
+                    <span class="chip">Sessions</span>
+                }
+                <span class="chip">Max deliveries @settings.MaxDeliveryCount</span>
+                <span class="chip">Lock @Fmt.Duration(settings.LockDuration)</span>
+                <span class="chip">TTL @Fmt.Duration(settings.DefaultMessageTimeToLive)</span>
+                @if (counts.Scheduled > 0)
+                {
+                    <span class="chip" style="color: var(--sched-fg)">@Fmt.Count(counts.Scheduled) scheduled</span>
+                }
+                @if (settings.Status != "Active")
+                {
+                    <span class="chip" style="color: var(--dl-fg)">@settings.Status</span>
+                }
+            </div>
+        </div>
+    </header>
+
+    <div class="tabs-bar">
+        <nav class="tabs" aria-label="Message source">
+            <a class="tab" href="@Links.To(entity)" aria-current="@(DeadLetters ? null : "page")">
+                Active <span class="pill pill-active">@Fmt.Count(counts.Active)</span>
+            </a>
+            <a class="tab" href="@Links.To(entity, deadLetters: true)" aria-current="@(DeadLetters ? "page" : null)">
+                Dead-letter <span class="pill pill-dl">@Fmt.Count(counts.AllDeadLetters)</span>
+            </a>
+        </nav>
+        <div class="page-actions">
+            <button class="btn btn-icon" aria-label="Refresh" title="Refresh" disabled="@(loading || Session.Loading)" @onclick="RefreshAsync"><Icon Kind="refresh" Size="14" /></button>
+            <button class="btn" disabled="@(Session.Connection is null)" @onclick="() => OpenAsync(Dialog.Send)"><Icon Kind="send" Size="14" />@(IsSubscription ? "Send to topic…" : "Send…")</button>
+            <button class="btn" disabled="@(Session.Connection is null)" @onclick="() => OpenAsync(Dialog.Receive)">Receive &amp; delete…</button>
+            <button class="btn btn-danger" disabled="@(Session.Connection is null)" @onclick="() => OpenAsync(Dialog.Purge)">@(DeadLetters ? "Purge dead letters…" : "Purge…")</button>
+        </div>
+    </div>
+
+    @if (NeedsSession)
+    {
+        <div class="card session-bar">
+            <span style="font-size: 13px">This @(IsSubscription ? "subscription" : "queue") uses sessions. Read</span>
+            <label class="sr-only" for="session-id">Session ID</label>
+            <input id="session-id" class="input" placeholder="session ID" @bind="sessionInput" @onkeydown="OnSessionKey" />
+            <button class="btn btn-small" disabled="@(string.IsNullOrWhiteSpace(sessionInput))" @onclick="OpenSessionAsync">Open session</button>
+            <span class="muted" style="font-size: 12.5px">or</span>
+            <button class="btn btn-small" @onclick="NextSessionAsync">Next available session</button>
+            @if (sessionChoice is not null)
+            {
+                <span class="muted" style="font-size: 12.5px; margin-left: auto">
+                    @(page?.SessionId is { } sid ? $"Showing session {sid}" : loading ? "Waiting for a session…" : "No session has messages right now.")
+                </span>
+            }
+        </div>
+    }
+
+    @if (DeadLetters && reasons.Count > 0)
+    {
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center" role="group" aria-label="Filter by dead-letter reason">
+            <span class="muted" style="font-size: 12.5px">Reasons on this page</span>
+            @foreach (var (reason, count) in reasons)
+            {
+                <button class="toggle toggle-dl" aria-pressed="@(reasonFilter == reason ? "true" : "false")" @onclick="() => ToggleReason(reason)">@reason · @count</button>
+            }
+        </div>
+    }
+
+    <div class="split">
+        <section class="card grid-panel" aria-label="Messages" aria-busy="@(loading ? "true" : "false")">
+            @if (NeedsSession && sessionChoice is null)
+            {
+                <div class="grid-empty">Choose a session to see its messages.</div>
+            }
+            else if (page is null)
+            {
+                <div class="grid-empty">@(loading ? "Loading messages…" : "")</div>
+            }
+            else if (page.Messages.Count == 0)
+            {
+                <div class="grid-empty">@(DeadLetters ? "No dead letters." : "No messages.")</div>
+            }
+            else
+            {
+                <div class="grid-scroll">
+                    <table class="grid">
+                        <thead>
+                            <tr>
+                                <th class="label">Seq</th>
+                                <th class="label">Message ID</th>
+                                <th class="label">Subject</th>
+                                @if (DeadLetters) { <th class="label">Reason</th> }
+                                <th class="label">Enqueued</th>
+                                <th class="label" style="text-align: right">Deliv.</th>
+                                <th class="label" style="text-align: right">Size</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var message in VisibleMessages)
+                            {
+                                <tr class="@(message == selected ? "selected" : "")" @onclick="() => selected = message">
+                                    <td><button class="seq" aria-label="Show message @message.SequenceNumber" @onclick="() => selected = message">@message.SequenceNumber</button></td>
+                                    <td class="mono" style="color: var(--text-2)" title="@message.MessageId">@message.MessageId</td>
+                                    <td title="@message.Subject">
+                                        @message.Subject
+                                        @if (message.State != "Active")
+                                        {
+                                            <span class="chip" style="margin-left: 6px; font-size: 11px; padding: 1px 6px">@message.State</span>
+                                        }
+                                    </td>
+                                    @if (DeadLetters) { <td class="reason" title="@message.DeadLetterReason">@message.DeadLetterReason</td> }
+                                    <td class="mono" style="color: var(--text-2)" title="@Fmt.Time(message.EnqueuedTime, full: true)">@Fmt.Time(message.EnqueuedTime)</td>
+                                    <td class="num">@message.DeliveryCount</td>
+                                    <td class="num" style="color: var(--text-2)">@Fmt.Size(message.SizeBytes)</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+            @if (page is not null && (page.Messages.Count > 0 || previousStarts.Count > 0))
+            {
+                <div class="grid-foot">
+                    <span>@PageLabel</span>
+                    <div style="display: flex; gap: 6px">
+                        <button class="btn btn-small" disabled="@(previousStarts.Count == 0 || loading)" @onclick="PreviousAsync">Previous</button>
+                        <button class="btn btn-small" disabled="@(page.NextFromSequenceNumber is null || loading)" @onclick="NextAsync">Next @PageSize</button>
+                    </div>
+                </div>
+            }
+        </section>
+
+        @if (selected is not null)
+        {
+            <MessageDetails Message="selected" DeadLetter="DeadLetters" />
+        }
+    </div>
+
+    @switch (dialog)
+    {
+        case Dialog.Send:
+            <SendDialog Target="entity" OnClose="CloseDialog" OnSent="AfterChangeAsync" />
+            break;
+        case Dialog.Receive:
+            <ReceiveDialog Entity="entity" Source="Source" CurrentCount="SourceCount" NeedsSession="NeedsSession"
+                           SessionId="@(page?.SessionId ?? sessionChoice?.SessionId)" OnClose="CloseDialog" OnChanged="() => AfterChangeAsync(entity)" />
+            break;
+        case Dialog.Purge:
+            <PurgeDialog Entity="entity" Source="Source" CurrentCount="SourceCount" NeedsSession="settings.RequiresSession"
+                         OnClose="CloseDialog" OnChanged="() => AfterChangeAsync(entity)" />
+            break;
+    }
+}
+
+@code {
+    private const int PageSize = 50;
+
+    [SupplyParameterFromQuery(Name = "name")] public string? Name { get; set; }
+    [SupplyParameterFromQuery(Name = "topic")] public string? Topic { get; set; }
+    [SupplyParameterFromQuery(Name = "dlq")] public bool DeadLetters { get; set; }
+
+    private EntityRef? entity;
+    private SubscriptionNode? subscription;
+    private ReceiverSettings? settings;
+    private EntityCounts counts = EntityCounts.None;
+    private IReadOnlyList<Feeder> feeders = [];
+
+    private MessagePage? page;
+    private MessageView? selected;
+    private readonly Stack<long> previousStarts = new();
+    private long currentStart;
+    private bool loading;
+    private string? loadedKey;
+    private CancellationTokenSource? loadCancellation;
+
+    private enum Dialog { None, Send, Receive, Purge }
+    private Dialog dialog;
+
+    private string sessionInput = "";
+    private SessionChoice? sessionChoice;
+
+    private List<(string Reason, int Count)> reasons = [];
+    private string? reasonFilter;
+
+    private bool IsSubscription => Navigation.ToBaseRelativePath(Navigation.Uri).StartsWith("subscription", StringComparison.OrdinalIgnoreCase);
+
+    private MessageSource Source => DeadLetters ? MessageSource.DeadLetter : MessageSource.Active;
+
+    /// <summary>
+    /// The count receive-and-delete and purge act on. For dead letters that is the dead-letter queue alone: the
+    /// transfer dead-letter queue (in the tab's total) is not read by either.
+    /// </summary>
+    private long SourceCount => DeadLetters ? counts.DeadLetter : counts.Active;
+
+    /// <summary>Dead-letter queues have no sessions, so only the active messages need a session.</summary>
+    private bool NeedsSession => settings?.RequiresSession == true && !DeadLetters;
+
+    private IEnumerable<MessageView> VisibleMessages =>
+        (page?.Messages ?? []).Where(m => reasonFilter is null || ReasonOf(m) == reasonFilter);
+
+    private string PageLabel
+    {
+        get
+        {
+            if (page is null || page.Messages.Count == 0) return "No more messages.";
+            long first = (long)previousStarts.Count * PageSize + 1;
+            long last = first + page.Messages.Count - 1;
+            long total = DeadLetters ? counts.AllDeadLetters : counts.Active + counts.Scheduled;
+            string range = $"{Fmt.Count(first)}–{Fmt.Count(last)}";
+            return NeedsSession || total < last ? range : $"{range} of {Fmt.Count(total)}";
+        }
+    }
+
+    protected override async Task OnInitializedAsync()
+    {
+        Session.Changed += OnSessionChanged;
+        await Session.EnsureInitializedAsync();
+    }
+
+    protected override async Task OnParametersSetAsync()
+    {
+        Resolve();
+        string key = $"{Session.Current?.Name}|{(IsSubscription ? "sub" : "queue")}|{Topic}|{Name}|{DeadLetters}";
+        if (key == loadedKey) return;
+
+        loadedKey = key;
+        dialog = Dialog.None;
+        page = null;
+        selected = null;
+        previousStarts.Clear();
+        reasonFilter = null;
+        reasons = [];
+        sessionChoice = null;
+        sessionInput = "";
+        await LoadAsync(0);
+    }
+
+    /// <summary>Finds the entity in the session's tree; counts and settings come from there.</summary>
+    private void Resolve()
+    {
+        var tree = Session.Tree;
+        subscription = null;
+        if (IsSubscription)
+        {
+            subscription = tree.FindSubscription(Topic ?? "", Name ?? "");
+            entity = subscription?.Ref;
+            settings = subscription?.Settings;
+            counts = subscription?.Counts ?? EntityCounts.None;
+        }
+        else
+        {
+            var queue = tree.FindQueue(Name ?? "");
+            entity = queue?.Ref;
+            settings = queue?.Settings;
+            counts = queue?.Counts ?? EntityCounts.None;
+        }
+        feeders = entity is QueueRef q ? tree.FeedersOf(q.Name) : [];
+    }
+
+    private async Task LoadAsync(long fromSequenceNumber)
+    {
+        var connection = Session.Connection;
+        if (entity is null || connection is null) return;
+        if (NeedsSession && sessionChoice is null) return;
+
+        loadCancellation?.Cancel();
+        var cancellation = loadCancellation = new CancellationTokenSource();
+        loading = true;
+        StateHasChanged();
+        try
+        {
+            var result = await connection.PeekAsync(entity, Source, fromSequenceNumber, PageSize,
+                NeedsSession ? sessionChoice : null, cancellation.Token);
+            if (cancellation.IsCancellationRequested) return;
+            page = result;
+            currentStart = fromSequenceNumber;
+            if (NeedsSession) sessionChoice = sessionChoice?.After(result); // stay in the session this page read
+            selected = result.Messages.FirstOrDefault();
+            reasons = DeadLetters
+                ? result.Messages.GroupBy(ReasonOf).Select(g => (g.Key, g.Count())).OrderByDescending(r => r.Item2).ToList()
+                : [];
+            if (reasonFilter is not null && reasons.All(r => r.Reason != reasonFilter)) reasonFilter = null;
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            Session.ReportError(DeadLetters ? "Read dead letters" : "Read messages", ex);
+            page ??= new MessagePage([], null);
+        }
+        finally
+        {
+            if (cancellation == loadCancellation) loading = false;
+        }
+    }
+
+    /// <summary>Refreshes this entity's counts (not the whole tree) and reloads the current page.</summary>
+    private async Task RefreshAsync()
+    {
+        if (entity is not null) await Session.RefreshCountsAsync(entity);
+        await LoadAsync(currentStart);
+    }
+
+    /// <summary>
+    /// Opens an action dialog. Receive and purge first re-read this entity's counts, so the confirmation shows what is
+    /// there now rather than when the tree was loaded.
+    /// </summary>
+    private async Task OpenAsync(Dialog which)
+    {
+        if (which != Dialog.Send && entity is not null)
+        {
+            await Session.RefreshCountsAsync(entity);
+            Resolve();
+        }
+        dialog = which;
+    }
+
+    private void CloseDialog() => dialog = Dialog.None;
+
+    /// <summary>After a send, receive or purge: refresh the counts it changed and reread this page from the start.</summary>
+    private async Task AfterChangeAsync(EntityRef changed)
+    {
+        await Session.RefreshAfterChangeAsync(changed);
+        Resolve();
+        previousStarts.Clear();
+        await LoadAsync(0);
+    }
+
+    private async Task NextAsync()
+    {
+        if (page?.NextFromSequenceNumber is not { } next) return;
+        previousStarts.Push(currentStart);
+        await LoadAsync(next);
+    }
+
+    private async Task PreviousAsync()
+    {
+        if (previousStarts.Count == 0) return;
+        await LoadAsync(previousStarts.Pop());
+    }
+
+    private async Task OpenSessionAsync()
+    {
+        if (string.IsNullOrWhiteSpace(sessionInput)) return;
+        sessionChoice = SessionChoice.Id(sessionInput.Trim());
+        previousStarts.Clear();
+        await LoadAsync(0);
+    }
+
+    private async Task NextSessionAsync()
+    {
+        sessionChoice = SessionChoice.NextAvailable;
+        sessionInput = "";
+        previousStarts.Clear();
+        await LoadAsync(0);
+    }
+
+    private async Task OnSessionKey(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter") await OpenSessionAsync();
+    }
+
+    private void ToggleReason(string reason) => reasonFilter = reasonFilter == reason ? null : reason;
+
+    private static string ReasonOf(MessageView message) => message.DeadLetterReason ?? "(no reason)";
+
+    private static string FeederName(Feeder feeder) =>
+        (feeder.Source is SubscriptionRef s ? s.Topic + "/" + s.Name : feeder.Source.DisplayName) + (feeder.DeadLetters ? " (dead letters)" : "");
+
+    private void OnSessionChanged() => InvokeAsync(async () =>
+    {
+        bool hadEntity = entity is not null;
+        Resolve();
+        StateHasChanged();
+        // The tree arrived after the page opened (or the profile changed): load the messages now.
+        if (!hadEntity && entity is not null && page is null && !loading)
+        {
+            loadedKey = null;
+            await OnParametersSetAsync();
+            StateHasChanged();
+        }
+    });
+
+    public void Dispose()
+    {
+        Session.Changed -= OnSessionChanged;
+        loadCancellation?.Cancel();
+    }
+}

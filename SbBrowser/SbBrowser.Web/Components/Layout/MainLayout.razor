@@ -1,0 +1,46 @@
+@inherits LayoutComponentBase
+@implements IDisposable
+@inject BrowserSession Session
+
+<div class="sb-app">
+    <Sidebar />
+    <main class="sb-main">
+        @if (Session.Error is { } error)
+        {
+            <div class="banner banner-error" role="alert">
+                <Icon Kind="alert" Size="16" />
+                <div class="banner-body">
+                    <strong>@error.Operation failed</strong>
+                    <span class="banner-msg">@error.Message</span>
+                </div>
+                <button class="banner-close" aria-label="Dismiss error" @onclick="Session.DismissError"><Icon Kind="close" Size="14" /></button>
+            </div>
+        }
+        @if (Session.Current is null && !Session.Loading && initialized)
+        {
+            <div class="card empty-state">
+                <h2>No connection yet</h2>
+                <p>Add a connection string in the panel on the left to browse a namespace.</p>
+            </div>
+        }
+        else
+        {
+            @Body
+        }
+    </main>
+</div>
+
+@code {
+    private bool initialized;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Session.Changed += OnSessionChanged;
+        await Session.EnsureInitializedAsync();
+        initialized = true;
+    }
+
+    private void OnSessionChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Session.Changed -= OnSessionChanged;
+}

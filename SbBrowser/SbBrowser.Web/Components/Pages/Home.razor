@@ -1,0 +1,220 @@
+@page "/"
+@implements IDisposable
+@inject BrowserSession Session
+
+<PageTitle>Overview · @SbBrowserInfo.Name</PageTitle>
+
+<header class="page-head">
+    <div>
+        <div class="page-title"><h1 class="sans">Overview</h1></div>
+        <p class="muted" style="margin: 6px 0 0">Every topic, the subscriptions under it, and where each one delivers.</p>
+    </div>
+    <div class="page-actions">
+        <button class="btn" @onclick="Session.RefreshAsync" disabled="@Session.Loading"><Icon Kind="refresh" Size="14" />Refresh</button>
+        <button class="btn btn-primary" disabled="@(Session.Connection is null || Session.Tree.Queues.Count + Session.Tree.Topics.Count == 0)" @onclick="() => sending = true"><Icon Kind="send" Size="14" />Send message…</button>
+    </div>
+</header>
+
+<section aria-label="Totals" class="stats">
+    <div class="card stat">
+        <span class="label">Active messages</span>
+        <span class="stat-value active">@Fmt.Count(totals.Active)</span>
+    </div>
+    <div class="card stat">
+        <span class="label">Dead letters</span>
+        <span class="stat-value dl">@Fmt.Count(totals.AllDeadLetters)</span>
+    </div>
+    <div class="card stat">
+        <span class="label">Scheduled</span>
+        <span class="stat-value sched">@Fmt.Count(totals.Scheduled)</span>
+    </div>
+    <div class="card stat">
+        <span class="label">Entities</span>
+        <span class="stat-value text">@Fmt.Plural(Tree.Topics.Count, "topic", "topics") · @Fmt.Plural(Tree.Subscriptions.Count(), "sub", "subs") · @Fmt.Plural(Tree.Queues.Count, "queue", "queues")</span>
+    </div>
+</section>
+
+@if (attention.Count > 0)
+{
+    <section aria-labelledby="attention-title" style="display: flex; flex-direction: column; gap: 12px">
+        <div class="section-head"><h2 id="attention-title">Needs attention</h2></div>
+        <div class="attention">
+            @foreach (var item in attention)
+            {
+                <a class="card" href="@item.Href">
+                    <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+                        <span class="label">@item.Kind</span>
+                        <span class="pill @(item.DeadLetters ? "pill-dl" : "pill-active")">@Fmt.Count(item.Count)</span>
+                    </div>
+                    <span class="mono" style="font-size: 13px; font-weight: 600; overflow-wrap: anywhere">@item.Name</span>
+                    <span class="mono muted" style="font-size: 11.5px; overflow-wrap: anywhere">@item.Parent</span>
+                    <span style="font-size: 12.5px; color: var(--text-2)">@item.Why</span>
+                </a>
+            }
+        </div>
+    </section>
+}
+
+<section aria-labelledby="flow-title" style="display: flex; flex-direction: column; gap: 12px">
+    <div class="section-head">
+        <h2 id="flow-title">Where messages go</h2>
+        <span class="muted" style="font-size: 12.5px">A message sent to a topic is copied to every subscription whose filter matches.</span>
+    </div>
+    @if (Tree.Topics.Count == 0)
+    {
+        <div class="card empty-state">@(Session.Connected ? "No topics in this namespace." : "Not connected.")</div>
+    }
+    else
+    {
+        <div class="card flow">
+            <div class="flow-inner">
+                <div class="flow-row head">
+                    <span class="label">Subscription</span><span class="label">Filter</span>
+                    <span class="label" style="text-align: right">Active</span><span class="label" style="text-align: right">Dead</span>
+                    <span class="label">Delivers to</span>
+                </div>
+                @foreach (var topic in Tree.Topics)
+                {
+                    <div class="flow-topic">
+                        <div class="flow-topic-head">
+                            <Icon Kind="topic" Class="ico-topic" />
+                            <a href="@Links.Topic(topic.Ref.Name)">@topic.Ref.Name</a>
+                            <span class="muted" style="font-size: 12px">@Fmt.Plural(topic.Subscriptions.Count, "subscription", "subscriptions")@(topic.ScheduledCount > 0 ? $" · {Fmt.Count(topic.ScheduledCount)} scheduled" : "")</span>
+                        </div>
+                        @if (topic.Subscriptions.Count == 0)
+                        {
+                            <div class="flow-row"><span class="dest-dropped" style="grid-column: 1 / -1">No subscriptions: messages sent to this topic are dropped.</span></div>
+                        }
+                        @foreach (var sub in topic.Subscriptions)
+                        {
+                            <div class="flow-row">
+                                <a class="mono ellipsis" style="font-size: 12.5px; color: var(--text)" href="@Links.Subscription(sub.Ref.Topic, sub.Ref.Name)" title="@sub.Ref.Name">@sub.Ref.Name</a>
+                                <span style="min-width: 0"><FilterChip Subscription="sub" /></span>
+                                <span class="flow-num @(sub.Counts.Active > 0 ? "active" : "")">@Fmt.Count(sub.Counts.Active)</span>
+                                <a class="flow-num @(sub.Counts.AllDeadLetters > 0 ? "dl" : "")" href="@Links.Subscription(sub.Ref.Topic, sub.Ref.Name, deadLetters: true)">@Fmt.Count(sub.Counts.AllDeadLetters)</a>
+                                <Destination Tree="Tree" Settings="sub.Settings" />
+                            </div>
+                        }
+                    </div>
+                }
+            </div>
+        </div>
+    }
+</section>
+
+@if (Tree.Queues.Count > 0)
+{
+    <section aria-labelledby="queues-title" style="display: flex; flex-direction: column; gap: 12px">
+        <div class="section-head"><h2 id="queues-title">Queues</h2></div>
+        <div class="card flow">
+            <div class="flow-inner">
+                <div class="flow-row head">
+                    <span class="label">Queue</span><span class="label">Fed by</span>
+                    <span class="label" style="text-align: right">Active</span><span class="label" style="text-align: right">Dead</span>
+                    <span class="label">Delivers to</span>
+                </div>
+                @foreach (var queue in Tree.Queues)
+                {
+                    var feeders = Tree.FeedersOf(queue.Ref.Name);
+                    <div class="flow-row" style="padding-left: 16px">
+                        <a class="mono ellipsis" style="font-size: 12.5px; color: var(--text); display: flex; align-items: center; gap: 8px" href="@Links.Queue(queue.Ref.Name)" title="@queue.Ref.Name">
+                            <Icon Kind="queue" Class="ico-queue" />@queue.Ref.Name
+                        </a>
+                        <span class="muted" style="font-size: 12.5px; min-width: 0">
+                            @if (feeders.Count == 0)
+                            {
+                                <text>Senders only</text>
+                            }
+                            else
+                            {
+                                for (int i = 0; i < feeders.Count; i++)
+                                {
+                                    var feeder = feeders[i];
+                                    if (i > 0) { <text>, </text> }
+                                    <a class="mono" href="@Links.To(feeder.Source)">@FeederName(feeder)</a>
+                                }
+                            }
+                        </span>
+                        <span class="flow-num @(queue.Counts.Active > 0 ? "active" : "")">@Fmt.Count(queue.Counts.Active)</span>
+                        <a class="flow-num @(queue.Counts.AllDeadLetters > 0 ? "dl" : "")" href="@Links.Queue(queue.Ref.Name, deadLetters: true)">@Fmt.Count(queue.Counts.AllDeadLetters)</a>
+                        <Destination Tree="Tree" Settings="queue.Settings" />
+                    </div>
+                }
+            </div>
+        </div>
+    </section>
+}
+
+@if (sending)
+{
+    <SendDialog OnClose="() => sending = false" OnSent="Session.RefreshAfterChangeAsync" />
+}
+
+@code {
+    private bool sending;
+
+    /// <summary>Active counts at or above this flag a queue or subscription as piling up.</summary>
+    private const long PilingUpThreshold = 100;
+
+    private sealed record AttentionItem(string Kind, long Count, bool DeadLetters, string Name, string Parent, string Why, string Href);
+
+    private EntityCounts totals = EntityCounts.None;
+    private List<AttentionItem> attention = [];
+
+    private NamespaceTree Tree => Session.Tree;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Session.Changed += OnSessionChanged;
+        await Session.EnsureInitializedAsync();
+        Summarize();
+    }
+
+    private void OnSessionChanged() => InvokeAsync(() =>
+    {
+        Summarize();
+        StateHasChanged();
+    });
+
+    private void Summarize()
+    {
+        var all = Tree.Queues.Select(q => q.Counts).Concat(Tree.Subscriptions.Select(s => s.Counts)).ToList();
+        totals = new EntityCounts(
+            all.Sum(c => c.Active),
+            all.Sum(c => c.DeadLetter),
+            all.Sum(c => c.Scheduled) + Tree.Topics.Sum(t => t.ScheduledCount),
+            all.Sum(c => c.Transfer),
+            all.Sum(c => c.TransferDeadLetter));
+
+        var items = new List<AttentionItem>();
+        foreach (var q in Tree.Queues)
+        {
+            string? fault = Fmt.FaultKind(q.Ref.Name);
+            if (fault is not null && q.Counts.Active > 0)
+                items.Add(new("Faults", q.Counts.Active, true, q.Ref.Name, "queue", fault + ": these messages failed in a consumer.", Links.Queue(q.Ref.Name)));
+            else if (q.Counts.Active >= PilingUpThreshold)
+                items.Add(new("Piling up", q.Counts.Active, false, q.Ref.Name, "queue", "Messages are waiting for a receiver.", Links.Queue(q.Ref.Name)));
+            if (q.Counts.AllDeadLetters > 0)
+                items.Add(new("Dead letters", q.Counts.AllDeadLetters, true, q.Ref.Name, "queue", FedBy(q.Ref.Name), Links.Queue(q.Ref.Name, deadLetters: true)));
+        }
+        foreach (var s in Tree.Subscriptions)
+        {
+            if (s.Counts.Active >= PilingUpThreshold)
+                items.Add(new("Piling up", s.Counts.Active, false, s.Ref.Name, s.Ref.Topic, "Messages are waiting for a receiver.", Links.Subscription(s.Ref.Topic, s.Ref.Name)));
+            if (s.Counts.AllDeadLetters > 0)
+                items.Add(new("Dead letters", s.Counts.AllDeadLetters, true, s.Ref.Name, s.Ref.Topic, "Open them to see each message's reason.", Links.Subscription(s.Ref.Topic, s.Ref.Name, deadLetters: true)));
+        }
+        attention = items.OrderByDescending(i => i.DeadLetters).ThenByDescending(i => i.Count).Take(8).ToList();
+    }
+
+    private string FedBy(string queue)
+    {
+        int count = Tree.FeedersOf(queue).Count;
+        return count == 0 ? "Open them to see each message's reason." : $"Fed by {Fmt.Plural(count, "entity", "entities")}.";
+    }
+
+    private static string FeederName(Feeder feeder) =>
+        (feeder.Source is SubscriptionRef s ? s.Topic + "/" + s.Name : feeder.Source.DisplayName) + (feeder.DeadLetters ? " (dead letters)" : "");
+
+    public void Dispose() => Session.Changed -= OnSessionChanged;
+}

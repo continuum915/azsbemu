@@ -24,6 +24,7 @@ jobs:
           dotnet-version: 10.0.x
       # Some integration tests are timing-sensitive on shared runners, so a failed run is retried once.
       - run: dotnet test AzsbEmu.Tests/AzsbEmu.Tests.csproj -c Release || dotnet test AzsbEmu.Tests/AzsbEmu.Tests.csproj -c Release --no-build
+      - run: dotnet test SbBrowser/SbBrowser.Tests/SbBrowser.Tests.csproj -c Release || dotnet test SbBrowser/SbBrowser.Tests/SbBrowser.Tests.csproj -c Release --no-build
 
   image:
     needs: test

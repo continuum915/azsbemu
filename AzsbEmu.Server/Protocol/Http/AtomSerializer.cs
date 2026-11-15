@@ -364,6 +364,22 @@ internal static class AtomSerializer
         return entry.ToString(SaveOptions.DisableFormatting);
     }
 
+    /// <summary>
+    /// The <c>NamespaceInfo</c> entry <c>GetNamespacePropertiesAsync</c> reads. The emulator reports itself as a
+    /// Standard namespace (topics are available) named after the host the client addressed.
+    /// </summary>
+    public static string WriteNamespaceInfoEntry(string name, DateTime createdUtc, string baseAddress)
+    {
+        var info = new XElement(Sb + "NamespaceInfo",
+            new XAttribute(XNamespace.Xmlns + "i", Xsi),
+            new XElement(Sb + "CreatedTime", Timestamp(createdUtc)),
+            new XElement(Sb + "MessagingSKU", "Standard"),
+            new XElement(Sb + "ModifiedTime", Timestamp(createdUtc)),
+            new XElement(Sb + "Name", name),
+            new XElement(Sb + "NamespaceType", "Messaging"));
+        return WriteEntry("$namespaceinfo", baseAddress, info, title: name);
+    }
+
     /// <summary>Wraps entries (as produced by the Write*Entry methods) in an Atom feed, as listings return them.</summary>
     public static string WriteFeed(string title, string selfUrl, IEnumerable<string> entries)
     {

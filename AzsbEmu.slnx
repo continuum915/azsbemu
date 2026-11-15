@@ -2,6 +2,12 @@
   <Project Path="AzsbEmu.Server/AzsbEmu.Server.csproj" />
   <Project Path="AzsbEmu.Tests/AzsbEmu.Tests.csproj" />
   <Project Path="AzsbEmu.Benchmarks/AzsbEmu.Benchmarks.csproj" />
+  <Folder Name="/SbBrowser/">
+    <Project Path="SbBrowser/SbBrowser.App/SbBrowser.App.csproj" />
+    <Project Path="SbBrowser/SbBrowser.Core/SbBrowser.Core.csproj" />
+    <Project Path="SbBrowser/SbBrowser.Tests/SbBrowser.Tests.csproj" />
+    <Project Path="SbBrowser/SbBrowser.Web/SbBrowser.Web.csproj" />
+  </Folder>
   <Folder Name="/Interop/">
     <Project Path="Interop/AzsbEmu.Interop.Contracts/AzsbEmu.Interop.Contracts.csproj" />
     <Project Path="Interop/AzsbEmu.Interop.Mt7Tests/AzsbEmu.Interop.Mt7Tests.csproj" />

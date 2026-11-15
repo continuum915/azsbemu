@@ -55,7 +55,7 @@ public class MassTransitDeadLetterForwardingTests : IAsyncLifetime
         Assert.Equal("order 42 is poison", forwarded.ApplicationProperties["MT-Fault-Message"]);
         Assert.False(forwarded.ApplicationProperties.TryGetValue("DeadLetterReason", out var reason) && Equals(reason, "com.microsoft:dead-letter"),
             "the AMQP error condition is not a dead-letter reason");
-        Assert.Equal("orders", forwarded.ApplicationProperties["DeadLetterSource"]);
+        Assert.Equal("orders", forwarded.DeadLetterSource);
 
         await using var ordersDlq = client.CreateReceiver("orders", new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
         Assert.Null(await ordersDlq.ReceiveMessageAsync(TimeSpan.FromSeconds(1)));

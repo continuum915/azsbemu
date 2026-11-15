@@ -50,7 +50,9 @@ public class MessageStore : IDisposable
         throw new KeyNotFoundException($"No message found at address {address}");
     }
 
-    public async Task<IReadOnlyList<(byte[] data, long address)>> PeekAsync(long fromSequenceNumber, int maxMessages, CancellationToken cancellationToken = default)
+    /// <param name="filter">When given, only stored messages it accepts are returned (and counted).</param>
+    public async Task<IReadOnlyList<(byte[] data, long address)>> PeekAsync(long fromSequenceNumber, int maxMessages,
+        Func<byte[], bool>? filter = null, CancellationToken cancellationToken = default)
     {
         if (maxMessages <= 0)
         {
@@ -71,7 +73,7 @@ public class MessageStore : IDisposable
             while (results.Count < maxMessages && scanner.GetNext(out byte[] data, out _, out long address, out _))
             {
                 var header = MessageSerializer.DecodeHeader(data);
-                if (header.SequenceNumber >= fromSequenceNumber)
+                if (header.SequenceNumber >= fromSequenceNumber && (filter is null || filter(data)))
                 {
                     results.Add((data, address));
                 }

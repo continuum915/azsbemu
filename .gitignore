@@ -26,3 +26,6 @@ Thumbs.db
 ehthumbs.db
 Desktop.ini
 /AzsbEmu.Benchmarks/results/*
+
+# SbBrowser.App's self-contained publish (SbBrowser/publish.ps1)
+/publish/SbBrowser/

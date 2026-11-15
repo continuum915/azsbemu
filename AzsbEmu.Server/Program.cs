@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using AzsbEmu.Server.Core;
 using AzsbEmu.Server.Config;
+using AzsbEmu.Server.Browser;
 using AzsbEmu.Server.Protocol.Http;
 
 var configuration = new ConfigurationBuilder()
@@ -13,6 +14,7 @@ var configuration = new ConfigurationBuilder()
         ["--host"]     = "Host",
         ["--port"]     = "Port",
         ["--http-port"] = "HttpPort",
+        ["--browser-port"] = "BrowserPort",
         ["--data-dir"] = "DataDirectory"
     })
     .Build();
@@ -72,8 +74,10 @@ foreach (var topicCfg in config.Topics)
 string host = config.Host;
 int port = config.Port;
 string amqpAddress = $"amqp://{host}:{port}";
-// Clients can't connect to a wildcard address; show the loopback name instead.
-string clientHost = host is "0.0.0.0" or "::" or "*" ? "localhost" : host;
+// Clients can't connect to a wildcard address; show the loopback name instead. An IPv6 address needs brackets in a URL.
+string clientHost = host is "0.0.0.0" or "::" or "*" ? "localhost"
+    : System.Net.IPAddress.TryParse(host, out var ip) && ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? $"[{host}]"
+    : host;
 string connectionString = $"Endpoint=sb://{clientHost}/;SharedAccessKeyName=Root;SharedAccessKey=dummy;UseDevelopmentEmulator=true";
 
 var broker = new Broker(amqpAddress, entityManager, loggerFactory);
@@ -95,9 +99,37 @@ catch (Exception ex)
     managementAddress = "unavailable";
 }
 
+// SbBrowser is optional too: BrowserPort 0 turns it off, and a port that can't be bound only loses the web UI. It
+// reads entities through the management API, so without that it stays off rather than browse whatever holds the port.
+BrowserHost? browser = null;
+string browserAddress = "off";
+if (config.BrowserPort > 0 && managementApi is null)
+{
+    logger.LogWarning("SbBrowser is off: it needs the HTTP management API, which did not start.");
+    browserAddress = "off (needs the management API)";
+}
+else if (config.BrowserPort > 0)
+{
+    browser = new BrowserHost(loggerFactory, host, config.BrowserPort,
+        new SbBrowser.Core.Connections.ConnectionProfile("Emulator", connectionString, managementApi!.Port, port));
+    try
+    {
+        await browser.StartAsync();
+        browserAddress = $"http://{clientHost}:{browser.Port}";
+    }
+    catch (Exception ex)
+    {
+        logger.LogError(ex, "Could not start SbBrowser on port {BrowserPort}; the emulator runs without it. Set BrowserPort / --browser-port to a free port, or 0 to turn it off.", config.BrowserPort);
+        try { await browser.DisposeAsync(); } catch { /* never started */ }
+        browser = null;
+        browserAddress = "unavailable";
+    }
+}
+
 Console.WriteLine("Azure Service Bus Emulator is running.");
 Console.WriteLine($"Listening:         {amqpAddress}");
 Console.WriteLine($"Management API:    {managementAddress}");
+Console.WriteLine($"SbBrowser:         {browserAddress}");
 Console.WriteLine($"Connection String: {connectionString}");
 Console.WriteLine("Press Ctrl+C to stop.");
 
@@ -114,6 +146,12 @@ try
 }
 catch (TaskCanceledException) { }
 
+// A failed web UI shutdown (open browser tabs, say) must not stop the broker from closing its logs.
+if (browser != null)
+{
+    try { await browser.DisposeAsync(); }
+    catch (Exception ex) { logger.LogWarning(ex, "SbBrowser did not shut down cleanly."); }
+}
 if (managementApi != null) await managementApi.DisposeAsync();
 broker.Stop();
 entityManager.Dispose();

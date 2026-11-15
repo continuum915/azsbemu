@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <base href="/" />
+    <title>@SbBrowserInfo.Name</title>
+    @* Apply the saved theme (or the OS preference) before anything renders, so the page never flashes. *@
+    <script>
+        try {
+            var saved = localStorage.getItem('sb-theme');
+            document.documentElement.dataset.theme = saved || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        } catch (e) { }
+    </script>
+    <link rel="stylesheet" href="@Assets["_content/SbBrowser.Web/sbbrowser.css"]" />
+    <HeadOutlet @rendermode="RenderModeNoPrerender" />
+</head>
+<body>
+    <Routes @rendermode="RenderModeNoPrerender" />
+    <script src="@Assets["_framework/blazor.web.js"]"></script>
+    <script src="@Assets["_content/SbBrowser.Web/sbbrowser.js"]"></script>
+</body>
+</html>
+
+@code {
+    // No prerendering: every page talks to the namespace when it starts, and prerendering would do that twice.
+    private static readonly IComponentRenderMode RenderModeNoPrerender = new InteractiveServerRenderMode(prerender: false);
+}

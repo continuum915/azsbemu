@@ -10,8 +10,6 @@ public sealed record DeadLetterDetails(string? Reason, string? Description, IRea
 {
     public const string ReasonProperty = "DeadLetterReason";
     public const string DescriptionProperty = "DeadLetterErrorDescription";
-    /// <summary>Set on dead-lettered messages that were forwarded to another entity: the entity that dead-lettered them.</summary>
-    public const string SourceProperty = "DeadLetterSource";
 
     public static readonly DeadLetterDetails None = new(null, null, new Dictionary<string, object?>());
 

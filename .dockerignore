@@ -1,4 +1,4 @@
-# Only the server's sources are needed to build the image.
+# Only the server's sources, and the SbBrowser libraries it serves, are needed to build the image.
 **/bin
 **/obj
 .git
@@ -13,4 +13,6 @@ publish
 Interop
 AzsbEmu.Tests
 AzsbEmu.Benchmarks
+SbBrowser/SbBrowser.Tests
+SbBrowser/SbBrowser.App
 *.md

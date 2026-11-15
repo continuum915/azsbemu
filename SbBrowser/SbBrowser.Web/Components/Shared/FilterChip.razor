@@ -1,0 +1,13 @@
+@* What a subscription lets in: "All messages" quietly, a real filter as a highlighted expression. *@
+@if (Subscription.ReceivesAll)
+{
+    <span class="chip-all">All messages</span>
+}
+else
+{
+    <span class="chip-filter" title="@(string.Join("\n", Subscription.Rules.Select(r => r.Name + ": " + r.Filter)))">@Fmt.Filter(Subscription)</span>
+}
+
+@code {
+    [Parameter, EditorRequired] public SubscriptionNode Subscription { get; set; } = null!;
+}

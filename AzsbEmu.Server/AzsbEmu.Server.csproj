@@ -1,36 +1,40 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<!-- The Web SDK carries SbBrowser.Web's static assets, and the framework's blazor.web.js, into the emulator's output
+     (the framework asset package adds blazor.web.js only to Web SDK projects). -->
+<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Include the framework's static assets (blazor.web.js): the SDK adds them by itself only for projects with
+         .razor files, and SbBrowser's components live in SbBrowser.Web. -->
+    <RequiresAspNetWebAssets>true</RequiresAspNetWebAssets>
   </PropertyGroup>
 
   <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <!-- The Web SDK's implicit usings bring ASP.NET Core routing's RouteOptions, which clashes with Core.RouteOptions. -->
+    <Using Remove="Microsoft.AspNetCore.Routing" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="AMQPNetLite.Core" Version="2.5.2" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.15" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="10.0.7" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.CommandLine" Version="10.0.7" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.7" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.7" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.7" />
     <PackageReference Include="Microsoft.FASTER.Core" Version="2.6.5" />
   </ItemGroup>
 
   <ItemGroup>
-    <InternalsVisibleTo Include="AzsbEmu.Tests" />
+    <ProjectReference Include="..\SbBrowser\SbBrowser.Web\SbBrowser.Web.csproj" />
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="AzsbEmu.Tests" />
+    <InternalsVisibleTo Include="SbBrowser.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- appsettings.json is Content under the Web SDK, which copies it to the output and the publish folder. -->
     <None Include="..\docs\**\*" LinkBase="docs" />
-    <None Update="appsettings.json">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
   </ItemGroup>
 
 </Project>

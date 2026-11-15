@@ -1,0 +1,107 @@
+@inject IJSRuntime JS
+
+<aside class="card details" aria-label="Message details">
+    <div class="details-head">
+        <div style="display: flex; flex-direction: column; gap: 2px; min-width: 0">
+            <span class="label">Message</span>
+            <span class="mono ellipsis" style="font-size: 14px; font-weight: 600" title="@Message.MessageId">#@Message.SequenceNumber · @Message.MessageId</span>
+        </div>
+        <button class="btn btn-small" @onclick="CopyBodyAsync"><Icon Kind="copy" Size="13" />@(copied ? "Copied" : "Copy body")</button>
+    </div>
+
+    @if (DeadLetter || Message.DeadLetterReason is not null)
+    {
+        <div class="dl-box">
+            <span class="label">Dead-lettered@(Message.DeadLetterSource is { } source ? $" from {source}" : "")</span>
+            <span style="font-weight: 600; overflow-wrap: anywhere">@(Message.DeadLetterReason ?? "No reason given")</span>
+            @if (!string.IsNullOrEmpty(Message.DeadLetterErrorDescription))
+            {
+                <span class="desc">@Message.DeadLetterErrorDescription</span>
+            }
+        </div>
+    }
+
+    <div style="display: flex; flex-direction: column; gap: 6px">
+        <span class="label">Body · @(Message.ContentType ?? "no content type") · @Fmt.Size(Message.SizeBytes) · @Message.Body.Kind</span>
+        @if (Message.Body.Kind == BodyKind.Empty)
+        {
+            <span class="muted" style="font-size: 12.5px">The body is empty.</span>
+        }
+        else
+        {
+            <pre class="body">@Message.Body.Text</pre>
+            @if (Message.Body.Truncated)
+            {
+                <span class="muted" style="font-size: 12px">
+                    Showing the first @Fmt.Size(Message.Body.Kind == BodyKind.Binary ? BodyFormatter.DefaultBinaryLimitBytes : BodyFormatter.DefaultTextLimitBytes)
+                    of @Fmt.Size(Message.SizeBytes).
+                </span>
+            }
+        }
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 4px">
+        <span class="label">Application properties</span>
+        @if (Message.ApplicationProperties.Count == 0)
+        {
+            <span class="muted" style="font-size: 12.5px">None.</span>
+        }
+        else
+        {
+            <table class="kv">
+                <tbody>
+                    @foreach (var property in Message.ApplicationProperties)
+                    {
+                        <tr>
+                            <td class="mono">@property.Name</td>
+                            <td class="mono">@property.Value<span class="type">@property.TypeName</span></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </div>
+
+    <div style="display: flex; flex-direction: column; gap: 4px">
+        <span class="label">System properties</span>
+        <table class="kv">
+            <tbody>
+                <SystemRow Name="Message ID" Value="@Message.MessageId" />
+                <SystemRow Name="Subject" Value="@Message.Subject" />
+                <SystemRow Name="Correlation ID" Value="@Message.CorrelationId" />
+                <SystemRow Name="Session ID" Value="@Message.SessionId" />
+                <SystemRow Name="To" Value="@Message.To" />
+                <SystemRow Name="Reply to" Value="@Message.ReplyTo" />
+                <SystemRow Name="Content type" Value="@Message.ContentType" />
+                <SystemRow Name="Enqueued" Value="@Fmt.Time(Message.EnqueuedTime, full: true)" />
+                @if (Message.ScheduledEnqueueTime is { } scheduled)
+                {
+                    <SystemRow Name="Scheduled for" Value="@Fmt.Time(scheduled, full: true)" />
+                }
+                <SystemRow Name="Expires" Value="@Fmt.Time(Message.ExpiresAt, full: true)" />
+                <SystemRow Name="Time to live" Value="@Fmt.Duration(Message.TimeToLive)" />
+                <SystemRow Name="Delivery count" Value="@Message.DeliveryCount.ToString()" />
+                <SystemRow Name="State" Value="@Message.State" />
+            </tbody>
+        </table>
+    </div>
+</aside>
+
+@code {
+    [Parameter, EditorRequired] public MessageView Message { get; set; } = null!;
+    [Parameter] public bool DeadLetter { get; set; }
+
+    private bool copied;
+    private long copiedSequence = -1;
+
+    protected override void OnParametersSet()
+    {
+        if (Message.SequenceNumber != copiedSequence) copied = false;
+    }
+
+    private async Task CopyBodyAsync()
+    {
+        copied = await JS.InvokeAsync<bool>("sbBrowser.copy", Message.Body.Text);
+        copiedSequence = Message.SequenceNumber;
+    }
+}

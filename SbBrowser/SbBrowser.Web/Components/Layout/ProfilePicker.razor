@@ -1,0 +1,139 @@
+@implements IDisposable
+@inject BrowserSession Session
+
+@* The connection: a fixed label in emulator mode, a profile picker with add/remove in the standalone app. *@
+<div class="sb-conn">
+    <span class="sb-conn-dot @(Session.Connected ? "" : "down")" aria-hidden="true"></span>
+    @if (!Session.CanEditProfiles || Session.Profiles.Count == 0)
+    {
+        <div style="display: flex; flex-direction: column; min-width: 0; flex: 1">
+            <span style="font-weight: 600" class="ellipsis">@(Session.Current?.Name ?? "No connection")</span>
+            <span class="mono muted ellipsis" style="font-size: 11px">@Subtitle</span>
+        </div>
+    }
+    else
+    {
+        <label class="sr-only" for="sb-profile">Connection</label>
+        <select id="sb-profile" value="@Session.Current?.Name" @onchange="OnProfileChanged">
+            @foreach (var profile in Session.Profiles)
+            {
+                <option value="@profile.Name">@profile.Name</option>
+            }
+        </select>
+    }
+    @if (Session.CanEditProfiles)
+    {
+        <button class="btn btn-icon btn-small" style="width: 26px; height: 26px" aria-label="@(editing ? "Close connection form" : "Add or edit a connection")"
+                aria-expanded="@(editing ? "true" : "false")" @onclick="ToggleEditing">
+            <Icon Kind="@(editing ? "close" : "chevron-down")" Size="13" />
+        </button>
+    }
+</div>
+
+@if (editing)
+{
+    <form class="card form" @onsubmit="SaveAsync" @onsubmit:preventDefault>
+        <label>
+            Name
+            <input class="input" @bind="name" placeholder="Emulator" required />
+        </label>
+        <label>
+            Connection string
+            <input class="input" type="password" @bind="connectionString" autocomplete="off" required
+                   placeholder="Endpoint=sb://…;SharedAccessKeyName=…;SharedAccessKey=…" />
+        </label>
+        <div class="form-row">
+            <label>
+                Emulator HTTP port
+                <input class="input" type="number" min="1" max="65535" @bind="managementPort" />
+            </label>
+            <label>
+                Emulator AMQP port
+                <input class="input" type="number" min="1" max="65535" @bind="messagingPort" />
+            </label>
+        </div>
+        <span class="muted" style="font-size: 11.5px">The ports apply only to connection strings with UseDevelopmentEmulator=true. Strings are saved unencrypted in your profile folder.</span>
+        <div style="display: flex; gap: 8px; justify-content: space-between; flex-wrap: wrap">
+            @if (Session.Current is not null)
+            {
+                <button type="button" class="btn btn-small btn-danger" @onclick="RemoveAsync">Remove “@Session.Current.Name”</button>
+            }
+            <button type="submit" class="btn btn-small btn-primary" style="margin-left: auto">Save and connect</button>
+        </div>
+    </form>
+}
+
+@code {
+    private bool editing;
+    private string name = "";
+    private string connectionString = "";
+    private int managementPort = ConnectionProfile.DefaultEmulatorManagementPort;
+    private int messagingPort = ConnectionProfile.DefaultEmulatorMessagingPort;
+
+    private string Subtitle => Session.Current is null ? "Add a connection string"
+        : Session.Current.IsEmulator ? $"emulator · {Session.Current.EmulatorMessagingPort}"
+        : "Azure Service Bus";
+
+    protected override void OnInitialized() => Session.Changed += OnSessionChanged;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        await Session.EnsureInitializedAsync();
+        // A first-time user has nothing to pick: open the form with the emulator's usual settings.
+        if (Session.CanEditProfiles && Session.Profiles.Count == 0 && !editing)
+        {
+            editing = true;
+            name = "Emulator";
+            connectionString = "Endpoint=sb://localhost/;SharedAccessKeyName=Root;SharedAccessKey=dummy;UseDevelopmentEmulator=true";
+        }
+    }
+
+    private async Task OnProfileChanged(ChangeEventArgs e)
+    {
+        if (e.Value is string selected) await Session.SelectProfileAsync(selected);
+    }
+
+    private void ToggleEditing()
+    {
+        editing = !editing;
+        if (!editing) return;
+        // Edit the current profile; changing the name saves a new one.
+        var current = Session.Current;
+        name = current?.Name ?? "";
+        connectionString = current?.ConnectionString ?? "";
+        managementPort = current?.EmulatorManagementPort ?? ConnectionProfile.DefaultEmulatorManagementPort;
+        messagingPort = current?.EmulatorMessagingPort ?? ConnectionProfile.DefaultEmulatorMessagingPort;
+    }
+
+    private async Task SaveAsync()
+    {
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(connectionString)) return;
+        try
+        {
+            await Session.SaveProfileAsync(new ConnectionProfile(name.Trim(), connectionString.Trim(), managementPort, messagingPort));
+            if (Session.Error is null) editing = false;
+        }
+        catch (Exception ex)
+        {
+            Session.ReportError("Save connection", ex);
+        }
+    }
+
+    private async Task RemoveAsync()
+    {
+        if (Session.Current is not { } current) return;
+        try
+        {
+            await Session.RemoveProfileAsync(current.Name);
+            editing = Session.Profiles.Count == 0;
+        }
+        catch (Exception ex)
+        {
+            Session.ReportError("Remove connection", ex);
+        }
+    }
+
+    private void OnSessionChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Session.Changed -= OnSessionChanged;
+}

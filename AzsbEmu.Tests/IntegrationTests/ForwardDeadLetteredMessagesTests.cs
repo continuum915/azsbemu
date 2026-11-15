@@ -33,7 +33,8 @@ public class ForwardDeadLetteredMessagesTests : IDisposable
         Assert.Equal("poison", forwarded?.Body.ToString());
         Assert.Equal("BadPayload", forwarded!.ApplicationProperties["DeadLetterReason"]);
         Assert.Equal("could not parse", forwarded.ApplicationProperties["DeadLetterErrorDescription"]);
-        Assert.Equal("work", forwarded.ApplicationProperties["DeadLetterSource"]);
+        Assert.Equal("work", forwarded.DeadLetterSource);
+        Assert.False(forwarded.ApplicationProperties.ContainsKey("DeadLetterSource"), "Service Bus sets the source as an annotation, not a property");
         Assert.Null(await ReceiveAsync("work", deadLetter: true, wait: TimeSpan.FromSeconds(1)));
         Assert.Equal(0, _broker.GetQueue("work").MessageCount);
         Assert.Equal(0, _broker.GetQueue("work").DeadLetterMessageCount);

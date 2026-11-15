@@ -1,0 +1,204 @@
+@page "/topic"
+@implements IDisposable
+@inject BrowserSession Session
+@inject IJSRuntime JS
+
+<PageTitle>@Name · @SbBrowserInfo.Name</PageTitle>
+
+<nav aria-label="Breadcrumb" class="crumbs">
+    <a href="">Overview</a><span aria-hidden="true">/</span><span>Topics</span>
+</nav>
+
+@if (topic is null)
+{
+    <div class="card empty-state">
+        @if (Session.Loading || !Session.Connected)
+        {
+            <span>Loading…</span>
+        }
+        else
+        {
+            <h2>Topic not found</h2>
+            <p>There is no topic named <span class="mono">@Name</span> in this namespace.</p>
+        }
+    </div>
+}
+else
+{
+    var takesAll = topic.Subscriptions.Where(s => s.ReceivesAll).ToList();
+
+    <header class="page-head">
+        <div>
+            <div class="page-title">
+                <Icon Kind="topic" Size="22" Class="ico-topic" />
+                <h1 class="mono">@topic.Ref.Name</h1>
+                <button class="btn btn-icon btn-small" style="width: 28px; height: 28px" aria-label="Copy topic name" title="Copy name" @onclick="CopyNameAsync"><Icon Kind="copy" Size="13" /></button>
+            </div>
+            <div class="page-meta">
+                <span class="chip @(topic.Status == "Active" ? "chip-ok" : "")">@topic.Status</span>
+                <span class="chip">Topic</span>
+                <span class="chip">@Fmt.Plural(topic.Subscriptions.Count, "subscription", "subscriptions")</span>
+                <span class="chip">@Fmt.Count(topic.ScheduledCount) scheduled</span>
+                @{ var feeders = Session.Tree.FeedersOf(topic.Ref.Name); }
+                @if (feeders.Count > 0)
+                {
+                    <span class="chip">← fed by @(string.Join(", ", feeders.Select(f => f.Source.Path)))</span>
+                }
+            </div>
+        </div>
+        <div class="page-actions">
+            <button class="btn" @onclick="Session.RefreshAsync" disabled="@Session.Loading"><Icon Kind="refresh" Size="14" />Refresh</button>
+            <button class="btn btn-primary" disabled="@(Session.Connection is null)" @onclick="() => sending = true"><Icon Kind="send" Size="14" />Send to topic…</button>
+        </div>
+    </header>
+
+    @if (topic.Subscriptions.Count == 0)
+    {
+        <div class="banner banner-warn" role="status">
+            <Icon Kind="alert" Size="16" />
+            <div class="banner-body">
+                <strong>No subscriptions</strong>
+                <span>Messages sent to this topic are accepted and then dropped: nothing receives them.</span>
+            </div>
+        </div>
+    }
+    else
+    {
+        <div class="map" aria-label="Routing">
+            <div class="map-topic">
+                <div class="map-topic-card">
+                    <span class="label" style="color: var(--topic)">Topic</span>
+                    <span class="mono" style="font-size: 13px; font-weight: 600; overflow-wrap: anywhere">@topic.Ref.Name</span>
+                    <span style="font-size: 12.5px; color: var(--text-2)">Holds no messages itself. Each message sent here is copied to every subscription whose filter matches.</span>
+                </div>
+            </div>
+            <div class="map-stem" aria-hidden="true"></div>
+            <ul class="map-trunk" style="list-style: none; margin: 0">
+                @foreach (var sub in topic.Subscriptions)
+                {
+                    <li class="map-branch">
+                        <div class="card map-sub">
+                            <div class="map-sub-head">
+                                <Icon Kind="sub" Class="ico-sub" />
+                                <a href="@Links.Subscription(sub.Ref.Topic, sub.Ref.Name)">@sub.Ref.Name</a>
+                                <CountPills Counts="sub.Counts" ShowZero="true" Labels="true" />
+                            </div>
+                            @if (sub.Rules.Count == 0)
+                            {
+                                <div class="map-rule"><span class="dest-dropped">No rules: this subscription receives nothing.</span></div>
+                            }
+                            @foreach (var rule in sub.Rules)
+                            {
+                                <div class="map-rule">
+                                    <span class="map-rule-name">RULE @rule.Name</span>
+                                    @if (rule.MatchesAll)
+                                    {
+                                        <span class="chip-all">every message</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="chip-filter">@(rule.Kind == RuleFilterKind.Correlation ? "Correlation: " : "")@rule.Filter</span>
+                                    }
+                                    @if (rule.Action is { } action)
+                                    {
+                                        <span class="map-rule-action">then @action</span>
+                                    }
+                                </div>
+                            }
+                            <div class="map-links">
+                                <a href="@Links.Subscription(sub.Ref.Topic, sub.Ref.Name)">Messages</a>
+                                <a href="@Links.Subscription(sub.Ref.Topic, sub.Ref.Name, deadLetters: true)">Dead letters</a>
+                                @if (sub.Settings.RequiresSession)
+                                {
+                                    <span class="muted">Sessions</span>
+                                }
+                                <span class="muted">Max deliveries @sub.Settings.MaxDeliveryCount</span>
+                            </div>
+                        </div>
+                        <div class="map-arrow @(sub.Settings.ForwardTo is null ? "" : "on")" aria-hidden="true">
+                            <svg width="44" height="16" viewBox="0 0 44 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8h38M34 3l6 5-6 5" /></svg>
+                        </div>
+                        @if (sub.Settings.ForwardTo is { } target)
+                        {
+                            var entity = Session.Tree.FindQueueOrTopic(target);
+                            var counts = entity is QueueRef q ? Session.Tree.FindQueue(q.Name)?.Counts : null;
+                            <a class="map-dest fwd" href="@(entity is null ? "" : Links.To(entity))">
+                                <span class="label">Forwards to @(entity is TopicRef ? "topic" : "queue")</span>
+                                <span class="mono" style="font-size: 13px; font-weight: 600; overflow-wrap: anywhere">@target</span>
+                                @if (entity is null)
+                                {
+                                    <span class="dest-dropped">This entity does not exist.</span>
+                                }
+                                else if (counts is not null)
+                                {
+                                    <span class="mono" style="font-size: 12px; color: var(--text-2)">@Fmt.Count(counts.Active) active · @Fmt.Count(counts.AllDeadLetters) dead</span>
+                                }
+                            </a>
+                        }
+                        else
+                        {
+                            <div class="map-dest held">
+                                <span class="label">Held in subscription</span>
+                                <span style="font-size: 12.5px; color: var(--text-2)">Consumers receive from this subscription directly.</span>
+                            </div>
+                        }
+                    </li>
+                }
+            </ul>
+        </div>
+
+        <div class="banner banner-info" style="max-width: 900px">
+            <Icon Kind="info" Size="16" />
+            <p style="margin: 0; font-size: 13px">
+                A message that matches no subscription's rules is dropped.
+                @if (takesAll.Count == 0)
+                {
+                    <text>No subscription here takes every message, so a message can be lost if it matches none of the filters.</text>
+                }
+                else
+                {
+                    <text>Here </text>
+                    for (int i = 0; i < takesAll.Count; i++)
+                    {
+                        if (i > 0) { <text>@(i == takesAll.Count - 1 ? " and " : ", ")</text> }
+                        <span class="mono" style="color: var(--text)">@takesAll[i].Ref.Name</span>
+                    }
+                    <text> @(takesAll.Count == 1 ? "takes" : "take") every message, so nothing sent to this topic is lost.</text>
+                }
+            </p>
+        </div>
+    }
+}
+
+@if (sending && topic is not null)
+{
+    <SendDialog Target="topic.Ref" OnClose="() => sending = false" OnSent="Session.RefreshAfterChangeAsync" />
+}
+
+@code {
+    [SupplyParameterFromQuery(Name = "name")] public string? Name { get; set; }
+
+    private TopicNode? topic;
+    private bool sending;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Session.Changed += OnSessionChanged;
+        await Session.EnsureInitializedAsync();
+    }
+
+    protected override void OnParametersSet() => topic = Session.Tree.FindTopic(Name ?? "");
+
+    private void OnSessionChanged() => InvokeAsync(() =>
+    {
+        topic = Session.Tree.FindTopic(Name ?? "");
+        StateHasChanged();
+    });
+
+    private async Task CopyNameAsync()
+    {
+        if (topic is not null) await JS.InvokeAsync<bool>("sbBrowser.copy", topic.Ref.Name);
+    }
+
+    public void Dispose() => Session.Changed -= OnSessionChanged;
+}

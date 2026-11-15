@@ -1,0 +1,56 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- The standalone SbBrowser: hosts SbBrowser.Web on localhost. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Include the framework's static assets (blazor.web.js). The SDK only does this by itself when the host project
+         has .razor files, and SbBrowser's components live in SbBrowser.Web. -->
+    <RequiresAspNetWebAssets>true</RequiresAspNetWebAssets>
+    <!-- Kestrel only, never IIS: no web.config in the publish. -->
+    <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
+  </PropertyGroup>
+
+  <!-- A single-file publish (publish.ps1) puts the static web assets (wwwroot) and their endpoint manifest beside the
+       executable even with IncludeAllContentForSelfExtract: the SDK copies them with its own targets, not through
+       ResolvedFileToPublish, so the bundler never sees them. These targets hand them to the bundler instead, so the
+       executable is the whole app. It unpacks them on first run, and serves them from there: the content root is
+       AppContext.BaseDirectory, which a self-extracting bundle points at its unpacked files. -->
+  <PropertyGroup>
+    <_BundleWebAssets Condition="'$(PublishSingleFile)' == 'true' and '$(IncludeAllContentForSelfExtract)' == 'true'">true</_BundleWebAssets>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The Web SDK leaves appsettings.json beside a single-file executable; it holds only defaults, so bundle it. -->
+    <Content Update="appsettings.json" ExcludeFromSingleFile="false" />
+  </ItemGroup>
+
+  <Target Name="BundleWebAssetsIntoSingleFile" BeforeTargets="_ComputeFilesToBundle"
+          DependsOnTargets="CopyStaticWebAssetsToPublishDirectory" Condition="'$(_BundleWebAssets)' == 'true'">
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(_PublishStaticWebAssetsTargetPath)" RelativePath="%(_PublishStaticWebAssetsTargetPath.TargetPath)"
+                             CopyToPublishDirectory="PreserveNewest" />
+      <ResolvedFileToPublish Include="$(StaticWebAssetEndpointsPublishManifestPath)" RelativePath="$(TargetName).staticwebassets.endpoints.json"
+                             CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Declared before the SDK's copy targets, which share this AfterTargets and skip when their lists are empty. -->
+  <Target Name="SkipLooseWebAssetCopies" AfterTargets="_SplitPublishStaticWebAssetsByCopyOptions" Condition="'$(_BundleWebAssets)' == 'true'">
+    <ItemGroup>
+      <_PublishStaticWebAssetsCopyAlways Remove="@(_PublishStaticWebAssetsCopyAlways)" />
+      <_PublishStaticWebAssetsPreserveNewest Remove="@(_PublishStaticWebAssetsPreserveNewest)" />
+      <_PublishStaticWebAssetsIfDifferent Remove="@(_PublishStaticWebAssetsIfDifferent)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="RemoveLooseEndpointsManifest" AfterTargets="CopyStaticWebAssetsEndpointsManifest" Condition="'$(_BundleWebAssets)' == 'true'">
+    <Delete Files="$(PublishDir)$(TargetName).staticwebassets.endpoints.json" />
+  </Target>
+
+  <ItemGroup>
+    <ProjectReference Include="..\SbBrowser.Web\SbBrowser.Web.csproj" />
+  </ItemGroup>
+
+</Project>

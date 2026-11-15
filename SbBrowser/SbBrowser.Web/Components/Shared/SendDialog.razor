@@ -1,0 +1,269 @@
+@implements IDisposable
+@inject BrowserSession Session
+
+@* Sends a MessageDraft to a queue or topic. A subscription target sends to its topic. With no target the user picks
+   one. After a send the form stays filled, so the same message can be sent again. *@
+<Modal Title="@(target is TopicRef ? "Send to topic" : "Send message")" OnClose="OnClose" CanClose="!sending" Class="modal-wide">
+    <form class="modal-body form" @onsubmit="SendAsync" @onsubmit:preventDefault>
+        @if (Target is null)
+        {
+            <label>
+                To
+                <select class="input" value="@TargetKey" @onchange="OnTargetChanged" required>
+                    <option value="" disabled>Choose a queue or topic</option>
+                    @if (Session.Tree.Queues.Count > 0)
+                    {
+                        <optgroup label="Queues">
+                            @foreach (var q in Session.Tree.Queues)
+                            {
+                                <option value="@Links.KeyOf(q.Ref)">@q.Ref.Name</option>
+                            }
+                        </optgroup>
+                    }
+                    @if (Session.Tree.Topics.Count > 0)
+                    {
+                        <optgroup label="Topics">
+                            @foreach (var t in Session.Tree.Topics)
+                            {
+                                <option value="@Links.KeyOf(t.Ref)">@t.Ref.Name</option>
+                            }
+                        </optgroup>
+                    }
+                </select>
+            </label>
+        }
+        else if (target is not null)
+        {
+            <p class="muted" style="margin: 0; font-size: 13px">
+                To @(target is TopicRef ? "topic" : "queue") <span class="mono" style="color: var(--text)">@target.DisplayName</span>
+                @if (Target is SubscriptionRef)
+                {
+                    <text>: its rules decide which subscriptions get each message.</text>
+                }
+            </p>
+        }
+
+        <label>
+            Body
+            <textarea class="input textarea" rows="8" @bind="body" spellcheck="false" placeholder='{"orderId": 42}'></textarea>
+        </label>
+
+        <div class="form-row">
+            <label>
+                Content type
+                <input class="input" list="sb-content-types" @bind="contentType" placeholder="application/json" />
+                <datalist id="sb-content-types">
+                    <option value="application/json"></option>
+                    <option value="text/plain"></option>
+                    <option value="application/xml"></option>
+                    <option value="application/vnd.masstransit+json"></option>
+                </datalist>
+            </label>
+            <label>
+                Subject
+                <input class="input" @bind="subject" />
+            </label>
+            <label>
+                Message ID
+                <input class="input" @bind="messageId" placeholder="generated" />
+            </label>
+            <label>
+                Correlation ID
+                <input class="input" @bind="correlationId" />
+            </label>
+            <label>
+                Session ID@(SessionRequired ? " (required)" : "")
+                <input class="input" @bind="sessionId" required="@SessionRequired" />
+            </label>
+            <label>
+                Copies
+                <input class="input" type="number" min="1" max="@NamespaceConnection.MaxCopies" @bind="copies" @bind:event="oninput" />
+            </label>
+        </div>
+
+        <fieldset class="props">
+            <legend class="label">Application properties</legend>
+            @foreach (var row in properties)
+            {
+                <div class="prop-row">
+                    <input class="input" aria-label="Property name" placeholder="name" @bind="row.Name" />
+                    <select class="input" aria-label="Property type" @bind="row.Type">
+                        @foreach (var type in Enum.GetValues<PropertyType>())
+                        {
+                            <option value="@type">@type.ToString().ToLowerInvariant()</option>
+                        }
+                    </select>
+                    <input class="input" aria-label="Property value" placeholder="value" @bind="row.Value" />
+                    <button type="button" class="btn btn-icon btn-small" aria-label="Remove property" @onclick="() => properties.Remove(row)"><Icon Kind="close" Size="13" /></button>
+                </div>
+            }
+            <button type="button" class="btn btn-small" style="align-self: flex-start" @onclick="() => properties.Add(new Row())">Add property</button>
+        </fieldset>
+
+        <div class="schedule-row">
+            <label class="check">
+                <input type="checkbox" @bind="schedule" />
+                Schedule for later
+            </label>
+            @if (schedule)
+            {
+                <label class="sr-only" for="sb-schedule-at">Enqueue at</label>
+                <input id="sb-schedule-at" class="input" type="datetime-local" @bind="scheduleAt" @bind:format="yyyy-MM-ddTHH:mm" />
+                <span class="muted" style="font-size: 12px">times are the server's local time, as everywhere in SbBrowser</span>
+            }
+        </div>
+
+        @if (errors.Count > 0)
+        {
+            <ul class="form-errors" role="alert">
+                @foreach (var error in errors)
+                {
+                    <li>@error</li>
+                }
+            </ul>
+        }
+        @if (status is not null)
+        {
+            <p class="form-ok" role="status">@status</p>
+        }
+
+        <div class="modal-foot">
+            @if (sending)
+            {
+                <span class="muted" style="font-size: 12.5px">Sending@(copies > 1 ? $" {Fmt.Count(copies)} copies" : "")…</span>
+                <button type="button" class="btn" @onclick="Cancel">Cancel</button>
+            }
+            else
+            {
+                <button type="button" class="btn" @onclick="OnClose">Close</button>
+                <button type="submit" class="btn btn-primary" disabled="@(target is null)"><Icon Kind="send" Size="14" />@SendLabel</button>
+            }
+        </div>
+    </form>
+</Modal>
+
+@code {
+    /// <summary>The queue or topic to send to (a subscription sends to its topic); null lets the user choose.</summary>
+    [Parameter] public EntityRef? Target { get; set; }
+    [Parameter] public EventCallback OnClose { get; set; }
+    /// <summary>Called after a send with the entity sent to, so the page can refresh its counts.</summary>
+    [Parameter] public EventCallback<EntityRef> OnSent { get; set; }
+
+    private sealed class Row
+    {
+        public string Name { get; set; } = "";
+        public PropertyType Type { get; set; } = PropertyType.String;
+        public string Value { get; set; } = "";
+    }
+
+    private EntityRef? target;
+    private string body = "";
+    private string? contentType = "application/json";
+    private string? subject;
+    private string? messageId;
+    private string? correlationId;
+    private string? sessionId;
+    private int copies = 1;
+    private readonly List<Row> properties = [new()];
+    private bool schedule;
+    private DateTime scheduleAt = DateTime.Now.AddMinutes(5);
+
+    private bool sending;
+    private CancellationTokenSource? cancellation;
+    private List<string> errors = [];
+    private string? status;
+
+    private string TargetKey => target is null ? "" : Links.KeyOf(target);
+
+    private bool SessionRequired => target is QueueRef q && Session.Tree.FindQueue(q.Name)?.Settings.RequiresSession == true;
+
+    private string SendLabel => (schedule ? "Schedule" : "Send") + (copies > 1 ? $" {Fmt.Count(copies)} copies" : "");
+
+    protected override void OnParametersSet()
+    {
+        target ??= Target switch
+        {
+            SubscriptionRef s => new TopicRef(s.Topic),
+            _ => Target,
+        };
+    }
+
+    private void OnTargetChanged(ChangeEventArgs e)
+    {
+        string key = e.Value as string ?? "";
+        target = Session.Tree.Queues.Select(q => (EntityRef)q.Ref)
+            .Concat(Session.Tree.Topics.Select(t => t.Ref))
+            .FirstOrDefault(r => Links.KeyOf(r) == key);
+        status = null;
+    }
+
+    private async Task SendAsync()
+    {
+        status = null;
+        errors = Validate(out var draft);
+        var connection = Session.Connection;
+        if (errors.Count > 0 || target is null || draft is null) return;
+        if (connection is null)
+        {
+            errors = ["There is no connection to send with."];
+            return;
+        }
+
+        sending = true;
+        cancellation = new CancellationTokenSource();
+        var sentTo = target;
+        try
+        {
+            await connection.SendAsync(sentTo, draft, copies, cancellation.Token);
+            string what = Fmt.Plural(copies, "message", "messages");
+            status = draft.ScheduledEnqueueTime is { } at
+                ? $"Scheduled {what} on {sentTo.DisplayName} for {Fmt.Time(at, full: true)}."
+                : $"Sent {what} to {sentTo.DisplayName}.";
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            status = "Cancelled. Copies already sent stay sent.";
+        }
+        catch (Exception ex)
+        {
+            errors = [ErrorText.Describe(ex)];
+        }
+        finally
+        {
+            sending = false;
+        }
+        await OnSent.InvokeAsync(sentTo);
+    }
+
+    private List<string> Validate(out MessageDraft? draft)
+    {
+        draft = null;
+        var problems = new List<string>();
+        if (target is null) problems.Add("Choose a queue or topic to send to.");
+        if (copies < 1 || copies > NamespaceConnection.MaxCopies)
+            problems.Add($"Copies must be between 1 and {Fmt.Count(NamespaceConnection.MaxCopies)}.");
+        if (SessionRequired && string.IsNullOrWhiteSpace(sessionId))
+            problems.Add("This queue uses sessions: give the message a session ID.");
+
+        DateTimeOffset? at = null;
+        if (schedule)
+        {
+            at = new DateTimeOffset(DateTime.SpecifyKind(scheduleAt, DateTimeKind.Local));
+            if (at <= DateTimeOffset.Now) problems.Add("The scheduled time is in the past.");
+        }
+
+        var parsed = ApplicationProperties.Parse(properties.Select(r => new PropertyEntry(r.Name, r.Type, r.Value)));
+        problems.AddRange(parsed.Errors);
+        if (problems.Count > 0) return problems;
+
+        draft = new MessageDraft(body, NullIfBlank(contentType), NullIfBlank(subject), NullIfBlank(messageId), NullIfBlank(correlationId), NullIfBlank(sessionId),
+            parsed.Properties.Count > 0 ? parsed.Properties : null, at);
+        return problems;
+    }
+
+    private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    private void Cancel() => cancellation?.Cancel();
+
+    public void Dispose() => cancellation?.Cancel();
+}

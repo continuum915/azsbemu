@@ -269,7 +269,13 @@ internal sealed class ManagementLinkEndpoint : LinkEndpoint
             return CreateManagementResponse(400, CreatePeekResponseBody(new List()), error);
         }
 
-        var entries = store!.PeekAsync(fromSequenceNumber, messageCount).GetAwaiter().GetResult();
+        // A session receiver's peek names its session and sees only that session's messages.
+        string? sessionId = GetStringParameter(request, "session-id");
+        Func<byte[], bool>? inSession = string.IsNullOrEmpty(sessionId)
+            ? null
+            : data => string.Equals(MessageSerializer.Decode(data).message.Properties?.GroupId, sessionId, StringComparison.Ordinal);
+
+        var entries = store!.PeekAsync(fromSequenceNumber, messageCount, inSession).GetAwaiter().GetResult();
         var messages = new List();
         foreach (var (data, address) in entries)
         {

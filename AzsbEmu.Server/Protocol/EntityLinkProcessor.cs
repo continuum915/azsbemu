@@ -149,7 +149,8 @@ public class EntityLinkProcessor : ILinkProcessor
         if (sessionLock == null)
         {
             _logger.LogWarning("Rejecting receiver attach to '{Address}': Session '{SessionId}' is already locked", entityPath, sessionId);
-            context.Complete(new Error(ErrorCode.NotAllowed) { Description = $"Session '{sessionId}' is already locked by another receiver." });
+            // The condition Service Bus uses; the SDK maps it to ServiceBusFailureReason.SessionCannotBeLocked.
+            context.Complete(new Error(SessionCannotBeLockedError) { Description = $"Session '{sessionId}' is already locked by another receiver." });
             return;
         }
 
@@ -203,6 +204,7 @@ public class EntityLinkProcessor : ILinkProcessor
     }
 
     private static readonly Symbol TimeoutSymbol = new("com.microsoft:timeout");
+    private static readonly Symbol SessionCannotBeLockedError = new("com.microsoft:session-cannot-be-locked");
     private static readonly Symbol SessionIdProperty = new("com.microsoft:session-id");
     private static readonly Symbol SessionFilter = new("com.microsoft:session-filter");
     private static readonly Symbol LockedUntilUtcProperty = new("com.microsoft:locked-until-utc");

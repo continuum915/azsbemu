@@ -25,6 +25,8 @@ public partial class EntityManager
     private static readonly Symbol EnqueuedTimeUtcAnnotation = new("x-opt-enqueued-time-utc");
     private static readonly Symbol EnqueuedTimeAnnotation = new("x-opt-enqueued-time");
     private static readonly Symbol HopCountAnnotation = new("x-opt-azsbemu-hop-count");
+    /// <summary>On a forwarded dead-lettered message, the entity that dead-lettered it (read by the SDK as <c>DeadLetterSource</c>).</summary>
+    private static readonly Symbol DeadLetterSourceAnnotation = new("x-opt-deadletter-source");
 
     /// <summary>Routes a message to the queue, subscription (<c>topic/subscriptions/sub</c>) or topic at <paramref name="entityPath"/>.</summary>
     /// <returns>False if no entity exists at the path.</returns>
@@ -238,7 +240,7 @@ public partial class EntityManager
 
     /// <summary>
     /// If <paramref name="entity"/> forwards its dead-lettered messages, enqueues <paramref name="message"/> at that
-    /// target (marked with <c>DeadLetterSource</c>) and returns true. Returns false, so the caller keeps the message in
+    /// target (with the <c>x-opt-deadletter-source</c> annotation naming the entity) and returns true. Returns false, so the caller keeps the message in
     /// the entity's own DLQ, when there is no target, the hop limit is reached, or the target no longer exists.
     /// </summary>
     private bool TryForwardDeadLetter(IMessageEntity entity, Message message, int hopCount, bool flush)
@@ -252,7 +254,8 @@ public partial class EntityManager
 
         var forwarded = CopyForStore(message);
         forwarded.ApplicationProperties = CloneApplicationProperties(message.ApplicationProperties);
-        forwarded.ApplicationProperties[DeadLetterDetails.SourceProperty] = entity.Name;
+        forwarded.MessageAnnotations = CloneMessageAnnotations(message.MessageAnnotations); // not shared with the stored original
+        forwarded.MessageAnnotations[DeadLetterSourceAnnotation] = entity.Name;
         if (Route(target, forwarded, new RouteOptions(Flush: flush, HopCount: hopCount + 1))) return true;
 
         _logger.LogWarning("Dead-letter forward target {Target} of {EntityName} does not exist; keeping the message in the DLQ", target, entity.Name);
@@ -321,6 +324,16 @@ public partial class EntityManager
     private static ApplicationProperties CloneApplicationProperties(ApplicationProperties? source)
     {
         var clone = new ApplicationProperties();
+        if (source?.Map != null)
+        {
+            foreach (var kvp in source.Map) clone.Map[kvp.Key] = kvp.Value;
+        }
+        return clone;
+    }
+
+    private static MessageAnnotations CloneMessageAnnotations(MessageAnnotations? source)
+    {
+        var clone = new MessageAnnotations();
         if (source?.Map != null)
         {
             foreach (var kvp in source.Map) clone.Map[kvp.Key] = kvp.Value;
