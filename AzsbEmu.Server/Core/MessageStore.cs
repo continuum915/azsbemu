@@ -12,6 +12,14 @@ public class MessageStore : IDisposable
     private readonly CancellationTokenSource _commitCts = new();
     private readonly Task _commitTask;
 
+    /// <summary>
+    /// Caps FASTER commits in flight across every store in the process. A commit that writes metadata blocks a
+    /// thread-pool thread until its file write completes, and on Linux (FASTER's managed device) that write is itself a
+    /// thread-pool work item. Every new store makes one such commit, so creating a few hundred entities at once
+    /// blocked the whole pool behind writes it had no thread left to run, stalling the process for minutes.
+    /// </summary>
+    private static readonly SemaphoreSlim CommitGate = new(Math.Max(1, Environment.ProcessorCount / 2));
+
     public MessageStore(string logPath, ILogger logger, string? commitDir = null)
     {
         _logger = logger;
@@ -35,8 +43,23 @@ public class MessageStore : IDisposable
     public async Task<long> AppendAsync(byte[] message)
     {
         long address = _log.Enqueue(message);
-        await _log.CommitAsync().ConfigureAwait(false);
+        await CommitAsync().ConfigureAwait(false);
         return address;
+    }
+
+    /// <summary>Commits everything appended so far, waiting for it to be durable.</summary>
+    public void Commit()
+    {
+        CommitGate.Wait();
+        try { _log.Commit(spinWait: true); }
+        finally { CommitGate.Release(); }
+    }
+
+    private async Task CommitAsync()
+    {
+        await CommitGate.WaitAsync().ConfigureAwait(false);
+        try { await _log.CommitAsync().ConfigureAwait(false); }
+        finally { CommitGate.Release(); }
     }
 
     public async Task<(byte[] data, long nextAddress)> ReadAsync(long address)
@@ -91,10 +114,10 @@ public class MessageStore : IDisposable
         try
         {
             while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
-                await _log.CommitAsync().ConfigureAwait(false);
+                await CommitAsync().ConfigureAwait(false);
         }
         catch (OperationCanceledException) { }
-        await _log.CommitAsync().ConfigureAwait(false); // final flush on shutdown
+        await CommitAsync().ConfigureAwait(false); // final flush on shutdown
     }
 
     public void Dispose()

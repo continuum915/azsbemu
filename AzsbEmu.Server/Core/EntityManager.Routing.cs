@@ -207,7 +207,7 @@ public partial class EntityManager
         };
 
         long address = store.Append(MessageSerializer.Encode(messageToStore, header));
-        if (options.Flush) store.Log.Commit(spinWait: true);
+        if (options.Flush) store.Commit();
 
         if (options.SequenceNumber is long assigned) entity.UpdateNextSequenceNumber(assigned);
 
